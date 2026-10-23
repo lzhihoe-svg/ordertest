@@ -68,11 +68,13 @@ function layout({ title, user, body, flash, active = '', whatsapp = '' }) {
     ? user.role === 'admin'
       ? `
         <a href="/admin" class="${active === 'orders' ? 'active' : ''}">Orders</a>
+        <a href="/admin/quotes" class="${active === 'quotes' ? 'active' : ''}">Quotes</a>
         <a href="/admin/products" class="${active === 'products' ? 'active' : ''}">Products</a>
         <a href="/admin/customers" class="${active === 'customers' ? 'active' : ''}">Customers &amp; Pricing</a>`
       : `
         <a href="/" class="${active === 'home' ? 'active' : ''}">My Orders</a>
         <a href="/orders/new" class="${active === 'new' ? 'active' : ''}">New Order</a>
+        <a href="/quotes" class="${active === 'quotes' ? 'active' : ''}">Quotes</a>
         <a href="/account" class="${active === 'account' ? 'active' : ''}">My Account</a>`
     : '';
   return `<!doctype html>

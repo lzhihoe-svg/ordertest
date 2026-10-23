@@ -7,7 +7,7 @@ const multer = require('multer');
 const bcrypt = require('bcryptjs');
 
 const {
-  db, nextInvoiceNo, priceFor, tiersFor, setting, setSetting,
+  db, nextInvoiceNo, nextQuoteNo, priceFor, tiersFor, setting, setSetting,
   paidFor, creditBalance, logEvent,
 } = require('./src/db');
 const V = require('./src/views');
@@ -142,6 +142,23 @@ const docFilter = (req, file, cb) => {
 };
 const uploadReceipt = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 }, fileFilter: docFilter }).single('receipt');
 const uploadDelivery = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 }, fileFilter: docFilter }).single('proof');
+const uploadProofFile = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 }, fileFilter: docFilter }).single('proof_file');
+const uploadQuoteRef = multer({
+  storage,
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB
+  fileFilter: (req, file, cb) => {
+    if (/\.(zip|pdf|jpe?g|png|webp|ai)$/i.test(file.originalname)) return cb(null, true);
+    cb(new Error('Reference file must be zip, pdf, image or ai (max 100MB).'));
+  },
+}).single('reffile');
+const uploadTemplate = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
+  fileFilter: (req, file, cb) => {
+    if (/\.(zip|pdf|ai|psd|jpe?g|png)$/i.test(file.originalname)) return cb(null, true);
+    cb(new Error('Template must be zip, pdf, ai, psd or image (max 50MB).'));
+  },
+}).single('template');
 
 function runUpload(middleware) {
   return (req, res, next) =>
@@ -251,7 +268,8 @@ function historySection(order) {
     cancelled: 'Order cancelled', payment_submitted: 'Payment submitted',
     payment_recorded: 'Payment recorded', payment_verified: 'Payment verified',
     payment_rejected: 'Payment rejected', refund_resolved: 'Payment resolution',
-    delivery_proof: 'Delivery proof uploaded',
+    delivery_proof: 'Delivery proof uploaded', proof_sent: 'Digital proof sent',
+    proof_approved: 'Proof approved by customer', proof_changes: 'Proof changes requested',
   };
   return `
   <div class="card">
@@ -317,6 +335,17 @@ app.get('/account', requireCustomer, (req, res) => {
       <p class="muted small">Credit from cancelled orders can be applied to your next order at checkout.</p>
     </div>
     <div class="card">
+      <h2>Default Delivery Address</h2>
+      <form method="post" action="/account/address" class="stack">
+        <label>Address (prefilled on courier orders)
+          <textarea name="address" rows="3" maxlength="500" placeholder="Full delivery address including postcode">${V.esc(req.user.address || '')}</textarea>
+        </label>
+        <button class="btn btn-primary" type="submit">Save Address</button>
+      </form>
+    </div>
+  </div>
+  <div class="grid-2">
+    <div class="card">
       <h2>Change Password</h2>
       <form method="post" action="/account/password" class="stack">
         <label>Current password<input type="password" name="current" required autocomplete="current-password"></label>
@@ -344,6 +373,13 @@ app.post('/account/password', requireCustomer, (req, res) => {
   res.redirect('/account');
 });
 
+app.post('/account/address', requireCustomer, (req, res) => {
+  db.prepare('UPDATE users SET address = ? WHERE id = ?')
+    .run(String(req.body.address || '').trim().slice(0, 500), req.user.id);
+  flash(req, 'success', 'Default delivery address saved.');
+  res.redirect('/account');
+});
+
 // ---------- customer: dashboard ----------
 
 app.get('/', requireCustomer, (req, res) => {
@@ -352,6 +388,7 @@ app.get('/', requireCustomer, (req, res) => {
     .all(req.user.id);
   for (const o of orders) {
     if (o.status === 'needs_revision') o.action_note = 'Action needed: revise and resubmit';
+    else if (o.proof_status === 'pending') o.action_note = 'Proof awaiting your approval';
     else if (['submitted', 'confirmed', 'completed'].includes(o.status)) {
       const balance = round2(o.total - paidFor(o));
       if (balance > 0) o.action_note = `Balance due: ${V.rm(balance)}`;
@@ -373,6 +410,10 @@ app.get('/orders/new', requireCustomer, (req, res) => {
   const products = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY name').all();
   const leadDays = parseInt(setting('lead_days', '3'), 10);
   const minDate = klDatePlus(leadDays);
+  const expressPct = parseFloat(setting('express_percent', '20')) || 0;
+  const expressDays = parseInt(setting('express_lead_days', '1'), 10);
+  const expressMin = klDatePlus(expressDays);
+  const expressAvailable = expressPct > 0 && expressDays < leadDays;
   const credit = creditBalance(req.user.id);
 
   // Prefill quantities when re-ordering a previous order.
@@ -400,6 +441,7 @@ app.get('/orders/new', requireCustomer, (req, res) => {
         <td data-label="Product"><strong>${V.esc(p.name)}</strong>
           <div class="muted small">${V.esc(p.description)}</div>
           ${p.artwork_spec ? `<div class="spec-note">Artwork: ${V.esc(p.artwork_spec)}</div>` : ''}
+          ${p.template_stored ? `<div class="spec-note">&#11015; <a href="/products/${p.id}/template">Download artwork template</a> (${V.esc(p.template_name)})</div>` : ''}
           ${tierInfo ? `<div class="tier-row">${tierInfo}</div>` : ''}
         </td>
         <td data-label="Your Price" class="num price-cell" id="price_${p.id}">${V.rm(startPrice)} / ${V.esc(p.unit)}</td>
@@ -428,6 +470,7 @@ app.get('/orders/new', requireCustomer, (req, res) => {
         <tbody>${rows}</tbody>
         <tfoot>
           <tr><td colspan="4" class="num total-label">Subtotal</td><td class="num" id="f-subtotal">RM 0.00</td></tr>
+          <tr id="express-row" style="display:none"><td colspan="4" class="num total-label">Rush Order Surcharge (${expressPct}%)</td><td class="num" id="f-express">RM 0.00</td></tr>
           ${sst > 0 ? `<tr><td colspan="4" class="num total-label">SST (${sst}%)</td><td class="num" id="f-sst">RM 0.00</td></tr>` : ''}
           <tr><td colspan="4" class="num total-label"><strong>Order Total</strong></td>
           <td class="num"><strong id="order-total">RM 0.00</strong></td></tr>
@@ -453,12 +496,15 @@ app.get('/orders/new', requireCustomer, (req, res) => {
         <label class="check"><input type="radio" name="delivery_method" value="courier"> Courier Delivery</label>
       </div>
       <label id="address-label" style="display:none">Delivery address <span class="req-chip">Required for courier</span>
-        <textarea name="delivery_address" id="delivery-address" rows="2" placeholder="Full delivery address including postcode"></textarea>
+        <textarea name="delivery_address" id="delivery-address" rows="2" placeholder="Full delivery address including postcode">${V.esc(req.user.address || '')}</textarea>
       </label>
+      ${expressAvailable ? `
+      <label class="check express-opt"><input type="checkbox" name="is_express" id="is-express" value="1">
+        <span><strong>Rush order</strong> (+${expressPct}% surcharge) &mdash; earliest date becomes ${V.esc(fmtDay(expressMin))} (${expressDays} day${expressDays === 1 ? '' : 's'})</span></label>` : ''}
       <label>Needed by date <span class="req-chip">Required</span>
         <input type="date" name="needed_by" id="needed-by" min="${minDate}" required>
       </label>
-      <p class="muted small">Earliest available date is ${V.esc(fmtDay(minDate))} (production lead time: ${leadDays} days).</p>
+      <p class="muted small" id="lead-note">Earliest available date is ${V.esc(fmtDay(minDate))} (production lead time: ${leadDays} days).</p>
     </div>
     ${credit > 0 ? `
     <div class="card credit-card">
@@ -478,7 +524,11 @@ app.get('/orders/new', requireCustomer, (req, res) => {
   <script>
     const PRICING = ${JSON.stringify(pricing)};
     const SST = ${sst};
+    const EXPRESS_PCT = ${expressPct};
+    const MIN_DATE = '${minDate}';
+    const EXPRESS_MIN = '${expressMin}';
     const form = document.getElementById('order-form');
+    const expressBox = document.getElementById('is-express');
     const fmt = n => 'RM ' + n.toLocaleString('en-MY', {minimumFractionDigits: 2, maximumFractionDigits: 2});
     function unitPrice(pid, qty) {
       const p = PRICING[pid];
@@ -499,12 +549,19 @@ app.get('/orders/new', requireCustomer, (req, res) => {
         document.getElementById('sub_' + pid).textContent = fmt(sub);
         inp.classList.toggle('qty-bad', qty > 0 && qty < PRICING[pid].moq);
       });
-      const sstAmt = subtotal * SST / 100;
+      const isExpress = expressBox && expressBox.checked;
+      const expressAmt = isExpress ? subtotal * EXPRESS_PCT / 100 : 0;
+      const sstAmt = (subtotal + expressAmt) * SST / 100;
       const elS = document.getElementById('f-subtotal');
       if (elS) elS.textContent = fmt(subtotal);
+      const rowE = document.getElementById('express-row');
+      if (rowE) { rowE.style.display = isExpress ? '' : 'none';
+        document.getElementById('f-express').textContent = fmt(expressAmt); }
       const elT = document.getElementById('f-sst');
       if (elT) elT.textContent = fmt(sstAmt);
-      document.getElementById('order-total').textContent = fmt(subtotal + sstAmt);
+      document.getElementById('order-total').textContent = fmt(subtotal + expressAmt + sstAmt);
+      const nb = document.getElementById('needed-by');
+      nb.min = isExpress ? EXPRESS_MIN : MIN_DATE;
     }
     form.addEventListener('input', recalc);
     recalc();
@@ -570,17 +627,26 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
   const address = String(req.body.delivery_address || '').trim().slice(0, 500);
   if (method === 'courier' && !address) return fail('Delivery address is required for courier delivery.');
 
-  // Rule: needed-by date is required and must respect the production lead time.
+  // Rush order: shorter lead time, surcharge applied — only when enabled in settings.
   const leadDays = parseInt(setting('lead_days', '3'), 10);
-  const minDate = klDatePlus(leadDays);
+  const expressPct = parseFloat(setting('express_percent', '20')) || 0;
+  const expressDays = parseInt(setting('express_lead_days', '1'), 10);
+  const isExpress = !!req.body.is_express && expressPct > 0 && expressDays < leadDays;
+
+  // Rule: needed-by date is required and must respect the (rush or normal) lead time.
+  const effectiveLead = isExpress ? expressDays : leadDays;
+  const minDate = klDatePlus(effectiveLead);
   const neededBy = String(req.body.needed_by || '').trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(neededBy)) return fail('Please choose a needed-by date.');
-  if (neededBy < minDate) return fail(`The earliest available date is ${fmtDay(minDate)} (production lead time: ${leadDays} days).`);
+  if (neededBy < minDate) {
+    return fail(`The earliest available date is ${fmtDay(minDate)} (${isExpress ? 'rush' : 'production'} lead time: ${effectiveLead} days).`);
+  }
 
   const subtotal = round2(items.reduce((s, i) => s + i.lineTotal, 0));
+  const expressAmount = isExpress ? round2((subtotal * expressPct) / 100) : 0;
   const sstPercent = parseFloat(setting('sst_percent', '0')) || 0;
-  const sstAmount = round2((subtotal * sstPercent) / 100);
-  const total = round2(subtotal + sstAmount);
+  const sstAmount = round2(((subtotal + expressAmount) * sstPercent) / 100);
+  const total = round2(subtotal + expressAmount + sstAmount);
 
   // Store credit: apply up to the order total if the customer opted in.
   let creditApplied = 0;
@@ -593,12 +659,14 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
     const invNum = nextInvoiceNo();
     const info = db
       .prepare(
-        `INSERT INTO orders (order_no, invoice_no, customer_id, subtotal, sst_percent, sst_amount, total,
+        `INSERT INTO orders (order_no, invoice_no, customer_id, subtotal, is_express, express_percent,
+          express_amount, sst_percent, sst_amount, total,
           credit_applied, notes, wetransfer_link, delivery_method, delivery_address, needed_by)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
-        `ORD-${invNum}`, `INV-${invNum}`, req.user.id, subtotal, sstPercent, sstAmount, total,
+        `ORD-${invNum}`, `INV-${invNum}`, req.user.id, subtotal, isExpress ? 1 : 0,
+        isExpress ? expressPct : 0, expressAmount, sstPercent, sstAmount, total,
         creditApplied, String(req.body.notes || '').slice(0, 2000), wetransfer, method, address, neededBy
       );
     const id = info.lastInsertRowid;
@@ -642,6 +710,7 @@ function itemsCard(order, notesLabel) {
       .join('')}</tbody>
     <tfoot>
       <tr><td colspan="3" class="num total-label">Subtotal</td><td class="num">${V.rm(order.subtotal)}</td></tr>
+      ${order.is_express ? `<tr><td colspan="3" class="num total-label">Rush Order Surcharge (${order.express_percent}%)</td><td class="num">${V.rm(order.express_amount)}</td></tr>` : ''}
       ${order.sst_percent > 0 ? `<tr><td colspan="3" class="num total-label">SST (${order.sst_percent}%)</td><td class="num">${V.rm(order.sst_amount)}</td></tr>` : ''}
       <tr><td colspan="3" class="num total-label"><strong>Total</strong></td><td class="num"><strong>${V.rm(order.total)}</strong></td></tr>
     </tfoot>
@@ -714,6 +783,48 @@ function paymentsCard(order, { isAdmin }) {
   </div>`;
 }
 
+function proofSection(order, { isAdmin }) {
+  if (!['confirmed', 'completed', 'delivered'].includes(order.status) && !order.proof_status) return '';
+  const proofs = getFiles(order.id, 'proof');
+  const statusChip =
+    order.proof_status === 'approved' ? '<span class="badge badge-completed">Approved by customer</span>'
+    : order.proof_status === 'pending' ? '<span class="badge badge-submitted">Awaiting customer approval</span>'
+    : order.proof_status === 'changes' ? '<span class="badge badge-cancelled">Changes requested</span>'
+    : '';
+  return `
+  <div class="card ${order.proof_status === 'pending' && !isAdmin ? 'verify-card' : ''}">
+    <h2>Digital Proof ${statusChip}</h2>
+    ${proofs.length ? `<ul class="file-list">${proofs.map((f) => fileCard(f)).join('')}</ul>`
+      : `<p class="muted">${isAdmin ? 'No proof uploaded yet. Upload the print-ready proof for the customer to approve before production.' : 'Our team will upload a digital proof here for your approval before printing.'}</p>`}
+    ${order.proof_status === 'changes' && order.proof_note ? `<p><strong>Customer requested changes:</strong> ${V.esc(order.proof_note)}</p>` : ''}
+    ${order.proof_status === 'approved' ? `<p class="muted small">Approved on ${V.esc(V.fmtDate(order.proof_decided_at))}. Production can proceed.</p>` : ''}
+    ${isAdmin && order.status === 'confirmed' ? `
+    <form method="post" action="/admin/orders/${order.id}/proof" enctype="multipart/form-data" class="stack">
+      <label>${proofs.length ? 'Upload a revised proof' : 'Upload proof'} (PDF or image, max 20MB)
+        <input type="file" name="proof_file" accept=".pdf,.jpg,.jpeg,.png,.webp" required>
+      </label>
+      <button class="btn btn-outline" type="submit">Send Proof to Customer</button>
+    </form>` : ''}
+    ${!isAdmin && order.proof_status === 'pending' ? `
+    <p><strong>Please check the proof carefully</strong> (spelling, colours, placement, sizes). Production only starts after you approve.</p>
+    <div class="proof-actions">
+      <form method="post" action="/orders/${order.id}/proof-approve"
+        onsubmit="return confirm('Approve this proof? Production will proceed and the design can no longer be changed.')">
+        <button class="btn btn-primary" type="submit">Approve Proof &mdash; Proceed to Print</button>
+      </form>
+      <details class="inline-details">
+        <summary class="btn btn-outline">Request Changes</summary>
+        <form method="post" action="/orders/${order.id}/proof-changes" class="stack" style="margin-top:0.6rem">
+          <label>What should we change? <span class="req-chip">Required</span>
+            <textarea name="note" rows="2" required maxlength="500" placeholder="e.g. logo too small, change text colour to white"></textarea>
+          </label>
+          <button class="btn btn-outline" type="submit">Send Change Request</button>
+        </form>
+      </details>
+    </div>` : ''}
+  </div>`;
+}
+
 function refundBanner(order, { isAdmin }) {
   if (order.status !== 'cancelled') return '';
   const paid = paidFor(order);
@@ -775,6 +886,7 @@ app.get('/orders/:id', requireCustomer, (req, res) => {
     ${artworkCard(order, { isAdmin: false })}
     ${paymentsCard(order, { isAdmin: false })}
   </div>` : ''}
+  ${proofSection(order, { isAdmin: false })}
   ${commentsSection(order, `/orders/${order.id}/comment`)}
   ${historySection(order)}
   ${order.status === 'submitted' ? `
@@ -906,6 +1018,429 @@ app.post('/orders/:id/comment', requireCustomer, (req, res) => {
   res.redirect(`/orders/${order.id}`);
 });
 
+// ---------- quotations (custom job requests) ----------
+
+function getQuote(id) {
+  return db
+    .prepare(
+      `SELECT q.*, u.name AS customer_name, u.company AS customer_company
+       FROM quotes q JOIN users u ON u.id = q.customer_id WHERE q.id = ?`
+    )
+    .get(id);
+}
+function getQuoteItems(quoteId) {
+  return db.prepare('SELECT * FROM quote_items WHERE quote_id = ?').all(quoteId);
+}
+function getQuoteFiles(quoteId) {
+  return db.prepare('SELECT * FROM files WHERE quote_id = ? ORDER BY id DESC').all(quoteId);
+}
+function quoteTotal(quoteId) {
+  return round2(getQuoteItems(quoteId).reduce((s, i) => s + i.line_total, 0));
+}
+const QSTATUS = {
+  requested: { label: 'Quote Requested', badge: 'badge-submitted' },
+  quoted: { label: 'Quote Ready', badge: 'badge-confirmed' },
+  accepted: { label: 'Accepted', badge: 'badge-completed' },
+  declined: { label: 'Declined', badge: 'badge-cancelled' },
+};
+const qBadge = (s) => `<span class="badge ${QSTATUS[s].badge}">${QSTATUS[s].label}</span>`;
+
+function quotesTable(quotes, admin) {
+  if (!quotes.length) return '<div class="empty">No quote requests yet.</div>';
+  const base = admin ? '/admin/quotes/' : '/quotes/';
+  return `<div class="table-wrap"><table class="table">
+    <thead><tr><th>Quote #</th><th>Title</th>${admin ? '<th>Customer</th>' : ''}<th>Date</th><th class="num">Quoted Total</th><th>Status</th><th></th></tr></thead>
+    <tbody>${quotes
+      .map(
+        (q) => `<tr>
+      <td data-label="Quote #"><a href="${base}${q.id}"><strong>${V.esc(q.quote_no)}</strong></a></td>
+      <td data-label="Title">${V.esc(q.title)}</td>
+      ${admin ? `<td data-label="Customer">${V.esc(q.customer_company || q.customer_name)}</td>` : ''}
+      <td data-label="Date">${V.esc(V.fmtDate(q.created_at))}</td>
+      <td data-label="Quoted Total" class="num">${q.status === 'requested' ? '-' : V.rm(quoteTotal(q.id))}</td>
+      <td data-label="Status">${qBadge(q.status)}</td>
+      <td data-label=""><a class="btn btn-sm btn-outline" href="${base}${q.id}">View</a></td>
+    </tr>`
+      )
+      .join('')}</tbody></table></div>`;
+}
+
+function quoteItemsTable(quoteId) {
+  const items = getQuoteItems(quoteId);
+  if (!items.length) return '';
+  return `<div class="table-wrap"><table class="table">
+    <thead><tr><th>Description</th><th class="num">Unit Price</th><th class="num">Qty</th><th class="num">Subtotal</th></tr></thead>
+    <tbody>${items
+      .map(
+        (i) => `<tr><td data-label="Description">${V.esc(i.description)}</td>
+      <td data-label="Unit Price" class="num">${V.rm(i.unit_price)} / ${V.esc(i.unit)}</td>
+      <td data-label="Qty" class="num">${i.qty}</td>
+      <td data-label="Subtotal" class="num">${V.rm(i.line_total)}</td></tr>`
+      )
+      .join('')}</tbody>
+    <tfoot><tr><td colspan="3" class="num total-label"><strong>Quoted Total</strong></td>
+    <td class="num"><strong>${V.rm(quoteTotal(quoteId))}</strong></td></tr></tfoot>
+  </table></div>`;
+}
+
+app.get('/quotes', requireCustomer, (req, res) => {
+  const quotes = db
+    .prepare(`SELECT q.*, u.name AS customer_name, u.company AS customer_company
+              FROM quotes q JOIN users u ON u.id = q.customer_id
+              WHERE q.customer_id = ? ORDER BY q.id DESC`)
+    .all(req.user.id);
+  const body = `
+  <div class="page-head"><div><h1>Custom Quotes</h1>
+  <p class="muted">Need something that is not in the product list, or special specs? Request a quote and we will price it for you.</p></div></div>
+  <div class="card">
+    <h2>Request a Quote</h2>
+    <form method="post" action="/quotes" enctype="multipart/form-data" class="stack">
+      <label>What do you need? <span class="req-chip">Required</span>
+        <input name="title" required maxlength="150" placeholder="e.g. 300 corporate jackets with embroidery">
+      </label>
+      <label>Details (sizes, materials, colours, quantity, deadline...) <span class="req-chip">Required</span>
+        <textarea name="description" rows="4" required maxlength="3000" placeholder="Describe the job in as much detail as you can."></textarea>
+      </label>
+      <div class="grid-fields">
+        <label>Reference file (zip, pdf, image or ai — max 100MB)
+          <input type="file" name="reffile" accept=".zip,.pdf,.jpg,.jpeg,.png,.webp,.ai">
+        </label>
+        <label>Or a link (WeTransfer / Drive)
+          <input type="url" name="ref_link" placeholder="https://...">
+        </label>
+        <label>When do you need it? (optional)
+          <input type="date" name="needed_by" min="${klDatePlus(1)}">
+        </label>
+      </div>
+      <button class="btn btn-primary" type="submit">Submit Quote Request</button>
+    </form>
+  </div>
+  ${quotesTable(quotes, false)}`;
+  render(req, res, { title: 'Custom Quotes', user: req.user, body, active: 'quotes' });
+});
+
+app.post('/quotes', requireCustomer, runUpload(uploadQuoteRef), (req, res) => {
+  const title = String(req.body.title || '').trim().slice(0, 150);
+  const description = String(req.body.description || '').trim().slice(0, 3000);
+  const refLink = String(req.body.ref_link || '').trim().slice(0, 500);
+  if (!title || !description) {
+    if (req.file) fs.unlink(req.file.path, () => {});
+    flash(req, 'error', 'Please fill in what you need and the details.');
+    return res.redirect('/quotes');
+  }
+  if (refLink && !/^https?:\/\//i.test(refLink)) {
+    if (req.file) fs.unlink(req.file.path, () => {});
+    flash(req, 'error', 'The reference link must start with http:// or https://.');
+    return res.redirect('/quotes');
+  }
+  const neededBy = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.needed_by || '')) ? req.body.needed_by : '';
+  const quoteId = db.transaction(() => {
+    const info = db
+      .prepare('INSERT INTO quotes (quote_no, customer_id, title, description, ref_link, needed_by) VALUES (?,?,?,?,?,?)')
+      .run(nextQuoteNo(), req.user.id, title, description, refLink, neededBy);
+    if (req.file) {
+      db.prepare('INSERT INTO files (quote_id, kind, stored_name, original_name, size) VALUES (?,?,?,?,?)').run(
+        info.lastInsertRowid, 'quote_ref', req.file.filename, req.file.originalname, req.file.size
+      );
+    }
+    return info.lastInsertRowid;
+  })();
+  flash(req, 'success', 'Quote request submitted. We will price it and get back to you here.');
+  res.redirect(`/quotes/${quoteId}`);
+});
+
+function quoteDetailCommon(q) {
+  const files = getQuoteFiles(q.id);
+  return `
+  <div class="card">
+    <h2>Request Details</h2>
+    <p style="white-space: pre-line">${V.esc(q.description)}</p>
+    ${q.needed_by ? `<p class="muted small">Needed by: <strong>${V.esc(fmtDay(q.needed_by))}</strong></p>` : ''}
+    ${q.ref_link ? `<p class="small">Reference link: <a href="${V.esc(q.ref_link)}" target="_blank" rel="noopener noreferrer">${V.esc(q.ref_link)}</a></p>` : ''}
+    ${files.length ? `<ul class="file-list">${files.map((f) => fileCard(f)).join('')}</ul>` : ''}
+  </div>`;
+}
+
+app.get('/quotes/:id', requireCustomer, (req, res) => {
+  const q = getQuote(req.params.id);
+  if (!q || q.customer_id !== req.user.id) return res.status(404).send('Quote not found');
+  const today = klDatePlus(0);
+  const expired = q.status === 'quoted' && q.valid_until && q.valid_until < today;
+  const leadDays = parseInt(setting('lead_days', '3'), 10);
+  const minDate = klDatePlus(leadDays);
+  const body = `
+  <div class="page-head">
+    <div><h1>${V.esc(q.quote_no)}: ${V.esc(q.title)}</h1><p class="muted">Requested ${V.esc(V.fmtDate(q.created_at))}</p></div>
+    <div class="head-actions">${qBadge(q.status)}
+      ${q.order_id ? `<a class="btn btn-primary" href="/orders/${q.order_id}">View Order</a>` : ''}</div>
+  </div>
+  ${quoteDetailCommon(q)}
+  ${q.status === 'requested' ? '<div class="card"><p class="muted" style="margin:0">Our team is preparing your quote. You will see the price here once it is ready.</p></div>' : ''}
+  ${q.status !== 'requested' ? `<div class="card">
+    <h2>Our Quote</h2>
+    ${quoteItemsTable(q.id)}
+    ${q.admin_note ? `<p class="muted"><strong>Note from us:</strong> ${V.esc(q.admin_note)}</p>` : ''}
+    ${q.status === 'quoted' ? `<p class="small">Valid until <strong>${V.esc(fmtDay(q.valid_until))}</strong>${expired ? ' — <strong class="unpaid">expired, contact us to re-quote</strong>' : ''}.
+      SST (if applicable) will be added on the invoice when you accept.</p>` : ''}
+    ${q.status === 'declined' && q.decline_reason ? `<p class="muted"><strong>Declined:</strong> ${V.esc(q.decline_reason)}</p>` : ''}
+  </div>` : ''}
+  ${q.status === 'quoted' && !expired ? `
+  <div class="card verify-card">
+    <h2>Accept Quote &mdash; Place the Order</h2>
+    <p class="muted small">Accepting converts this quote into a real order with an invoice. Choose delivery to continue.</p>
+    <form method="post" action="/quotes/${q.id}/accept" class="stack">
+      <div class="radio-row">
+        <label class="check"><input type="radio" name="delivery_method" value="pickup" checked> Self Pickup</label>
+        <label class="check"><input type="radio" name="delivery_method" value="courier"> Courier Delivery</label>
+      </div>
+      <label>Delivery address (required for courier)
+        <textarea name="delivery_address" rows="2" placeholder="Full delivery address including postcode">${V.esc(req.user.address || '')}</textarea>
+      </label>
+      <label>Needed by date <span class="req-chip">Required</span>
+        <input type="date" name="needed_by" min="${minDate}" value="${q.needed_by >= minDate ? V.esc(q.needed_by) : ''}" required>
+      </label>
+      <button class="btn btn-primary btn-lg" type="submit">Accept Quote &amp; Generate Invoice (${V.rm(quoteTotal(q.id))} + SST if applicable)</button>
+    </form>
+  </div>
+  <div class="card cancel-card">
+    <h2>Decline Quote</h2>
+    <form method="post" action="/quotes/${q.id}/decline" class="stack">
+      <label>Reason (helps us re-quote) <span class="req-chip">Required</span>
+        <input name="reason" required maxlength="300" placeholder="e.g. over budget, timeline too long">
+      </label>
+      <button class="btn btn-danger" type="submit">Decline Quote</button>
+    </form>
+  </div>` : ''}`;
+  render(req, res, { title: `Quote ${q.quote_no}`, user: req.user, body, active: 'quotes' });
+});
+
+app.post('/quotes/:id/accept', requireCustomer, (req, res) => {
+  const q = getQuote(req.params.id);
+  if (!q || q.customer_id !== req.user.id) return res.status(404).send('Quote not found');
+  const today = klDatePlus(0);
+  // Rule: only a priced quote that is still valid can be accepted.
+  if (q.status !== 'quoted') {
+    flash(req, 'error', 'This quote cannot be accepted (not quoted yet, or already decided).');
+    return res.redirect(`/quotes/${q.id}`);
+  }
+  if (q.valid_until && q.valid_until < today) {
+    flash(req, 'error', 'This quote has expired. Please contact us for a re-quote.');
+    return res.redirect(`/quotes/${q.id}`);
+  }
+  const items = getQuoteItems(q.id);
+  if (!items.length) {
+    flash(req, 'error', 'This quote has no items. Please contact us.');
+    return res.redirect(`/quotes/${q.id}`);
+  }
+  const method = req.body.delivery_method === 'courier' ? 'courier' : 'pickup';
+  const address = String(req.body.delivery_address || '').trim().slice(0, 500);
+  if (method === 'courier' && !address) {
+    flash(req, 'error', 'Delivery address is required for courier delivery.');
+    return res.redirect(`/quotes/${q.id}`);
+  }
+  const leadDays = parseInt(setting('lead_days', '3'), 10);
+  const minDate = klDatePlus(leadDays);
+  const neededBy = String(req.body.needed_by || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(neededBy) || neededBy < minDate) {
+    flash(req, 'error', `Please choose a needed-by date of ${fmtDay(minDate)} or later.`);
+    return res.redirect(`/quotes/${q.id}`);
+  }
+  const subtotal = quoteTotal(q.id);
+  const sstPercent = parseFloat(setting('sst_percent', '0')) || 0;
+  const sstAmount = round2((subtotal * sstPercent) / 100);
+  const total = round2(subtotal + sstAmount);
+
+  const orderId = db.transaction(() => {
+    const invNum = nextInvoiceNo();
+    const info = db
+      .prepare(
+        `INSERT INTO orders (order_no, invoice_no, customer_id, subtotal, sst_percent, sst_amount, total,
+          notes, wetransfer_link, delivery_method, delivery_address, needed_by, quote_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      )
+      .run(
+        `ORD-${invNum}`, `INV-${invNum}`, req.user.id, subtotal, sstPercent, sstAmount, total,
+        `From quote ${q.quote_no}: ${q.title}`, q.ref_link, method, address, neededBy, q.id
+      );
+    const id = info.lastInsertRowid;
+    const insItem = db.prepare(
+      `INSERT INTO order_items (order_id, product_id, product_name, unit, qty, unit_price, line_total)
+       VALUES (?,NULL,?,?,?,?,?)`
+    );
+    for (const i of items) insItem.run(id, i.description, i.unit, i.qty, i.unit_price, i.line_total);
+    // Carry the quote's reference files over as the order's artwork.
+    for (const f of getQuoteFiles(q.id)) {
+      db.prepare('INSERT INTO files (order_id, kind, stored_name, original_name, size) VALUES (?,?,?,?,?)').run(
+        id, 'artwork', f.stored_name, f.original_name, f.size
+      );
+    }
+    db.prepare("UPDATE quotes SET status = 'accepted', decided_at = datetime('now'), order_id = ? WHERE id = ?")
+      .run(id, q.id);
+    logEvent(id, req.user, 'submitted', `Created by accepting quote ${q.quote_no}`);
+    return id;
+  })();
+
+  flash(req, 'success', `Quote accepted! Order created with invoice. Please make payment and upload your receipt.`);
+  res.redirect(`/orders/${orderId}`);
+});
+
+app.post('/quotes/:id/decline', requireCustomer, (req, res) => {
+  const q = getQuote(req.params.id);
+  if (!q || q.customer_id !== req.user.id) return res.status(404).send('Quote not found');
+  if (q.status !== 'quoted') {
+    flash(req, 'error', 'This quote cannot be declined now.');
+    return res.redirect(`/quotes/${q.id}`);
+  }
+  const reason = String(req.body.reason || '').trim().slice(0, 300);
+  if (!reason) {
+    flash(req, 'error', 'Please give a reason so we can re-quote better.');
+    return res.redirect(`/quotes/${q.id}`);
+  }
+  db.prepare("UPDATE quotes SET status = 'declined', decline_reason = ?, decided_at = datetime('now') WHERE id = ?")
+    .run(reason, q.id);
+  flash(req, 'success', 'Quote declined. Feel free to request a new quote any time.');
+  res.redirect(`/quotes/${q.id}`);
+});
+
+// ---- admin quotes ----
+
+function parseQuoteLines(text) {
+  const items = [];
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const parts = line.split('|').map((p) => p.trim());
+    if (parts.length !== 4) return null;
+    const [description, qtyS, unit, priceS] = parts;
+    const qty = parseInt(qtyS, 10);
+    const price = parseFloat(priceS);
+    if (!description || isNaN(qty) || qty < 1 || !unit || isNaN(price) || price < 0) return null;
+    items.push({ description: description.slice(0, 300), qty, unit: unit.slice(0, 30), price });
+  }
+  return items;
+}
+
+app.get('/admin/quotes', requireAdmin, (req, res) => {
+  const filter = String(req.query.status || '');
+  const valid = Object.keys(QSTATUS).includes(filter);
+  const quotes = db
+    .prepare(
+      `SELECT q.*, u.name AS customer_name, u.company AS customer_company
+       FROM quotes q JOIN users u ON u.id = q.customer_id
+       ${valid ? 'WHERE q.status = ?' : ''} ORDER BY q.id DESC`
+    )
+    .all(...(valid ? [filter] : []));
+  const counts = {};
+  for (const r of db.prepare('SELECT status, COUNT(*) AS n FROM quotes GROUP BY status').all()) counts[r.status] = r.n;
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  const tabs = `<div class="tabs">
+    <a href="/admin/quotes" class="${!valid ? 'active' : ''}">All (${total})</a>
+    ${Object.keys(QSTATUS).map(
+      (s) => `<a href="/admin/quotes?status=${s}" class="${filter === s ? 'active' : ''}">${QSTATUS[s].label} (${counts[s] || 0})</a>`
+    ).join('')}
+  </div>`;
+  const body = `
+  <div class="page-head"><div><h1>Quote Requests</h1><p class="muted">Price custom jobs; accepted quotes become orders automatically.</p></div></div>
+  ${tabs}
+  ${quotesTable(quotes, true)}`;
+  render(req, res, { title: 'Admin - Quotes', user: req.user, body, active: 'quotes' });
+});
+
+app.get('/admin/quotes/:id', requireAdmin, (req, res) => {
+  const q = getQuote(req.params.id);
+  if (!q) return res.status(404).send('Quote not found');
+  const linesValue = getQuoteItems(q.id)
+    .map((i) => `${i.description} | ${i.qty} | ${i.unit} | ${i.unit_price}`)
+    .join('\n');
+  const body = `
+  <div class="page-head">
+    <div><h1>${V.esc(q.quote_no)}: ${V.esc(q.title)}</h1>
+      <p class="muted">${V.esc(q.customer_company || q.customer_name)} (${V.esc(q.customer_name)}) &middot; ${V.esc(V.fmtDate(q.created_at))}</p></div>
+    <div class="head-actions">${qBadge(q.status)}
+      ${q.order_id ? `<a class="btn btn-primary" href="/admin/orders/${q.order_id}">View Order</a>` : ''}</div>
+  </div>
+  ${quoteDetailCommon(q)}
+  ${q.status === 'accepted' || q.status === 'declined' ? `<div class="card">
+    <h2>Quote ${q.status === 'accepted' ? '(accepted)' : '(declined)'}</h2>
+    ${quoteItemsTable(q.id)}
+    ${q.decline_reason ? `<p class="muted"><strong>Customer's reason:</strong> ${V.esc(q.decline_reason)}</p>` : ''}
+  </div>` : `
+  <div class="card verify-card">
+    <h2>${q.status === 'quoted' ? 'Update Quote' : 'Prepare Quote'}</h2>
+    <form method="post" action="/admin/quotes/${q.id}/quote" class="stack">
+      <label>Quote lines <span class="muted small">(one per line: description | qty | unit | unit price — e.g. Corporate jacket with embroidery | 300 | pcs | 48.00)</span>
+        <textarea name="lines" rows="5" required placeholder="Corporate jacket with embroidery | 300 | pcs | 48.00">${V.esc(linesValue)}</textarea>
+      </label>
+      <div class="grid-fields">
+        <label>Valid until <span class="req-chip">Required</span>
+          <input type="date" name="valid_until" min="${klDatePlus(1)}" value="${V.esc(q.valid_until)}" required></label>
+      </div>
+      <label>Note to customer (optional)
+        <input name="admin_note" value="${V.esc(q.admin_note)}" maxlength="500" placeholder="e.g. price includes 2 embroidery positions"></label>
+      <button class="btn btn-primary" type="submit">${q.status === 'quoted' ? 'Update Quote' : 'Send Quote to Customer'}</button>
+    </form>
+    <hr class="divider">
+    <details>
+      <summary class="muted">Decline this request</summary>
+      <form method="post" action="/admin/quotes/${q.id}/decline" class="stack" style="margin-top:0.75rem">
+        <label>Reason (shown to customer)<input name="reason" required maxlength="300"></label>
+        <button class="btn btn-danger" type="submit">Decline Request</button>
+      </form>
+    </details>
+  </div>`}`;
+  render(req, res, { title: `Admin - ${q.quote_no}`, user: req.user, body, active: 'quotes' });
+});
+
+app.post('/admin/quotes/:id/quote', requireAdmin, (req, res) => {
+  const q = getQuote(req.params.id);
+  if (!q) return res.status(404).send('Quote not found');
+  if (q.status !== 'requested' && q.status !== 'quoted') {
+    flash(req, 'error', 'This quote has already been decided.');
+    return res.redirect(`/admin/quotes/${q.id}`);
+  }
+  const items = parseQuoteLines(req.body.lines);
+  if (!items || !items.length) {
+    flash(req, 'error', 'Quote lines must each be: description | qty | unit | unit price (e.g. Jacket | 300 | pcs | 48.00).');
+    return res.redirect(`/admin/quotes/${q.id}`);
+  }
+  const validUntil = String(req.body.valid_until || '').trim();
+  // Rule: every quote carries an expiry date in the future.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(validUntil) || validUntil <= klDatePlus(0)) {
+    flash(req, 'error', 'Set a valid-until date after today.');
+    return res.redirect(`/admin/quotes/${q.id}`);
+  }
+  db.transaction(() => {
+    db.prepare('DELETE FROM quote_items WHERE quote_id = ?').run(q.id);
+    const ins = db.prepare(
+      'INSERT INTO quote_items (quote_id, description, unit, qty, unit_price, line_total) VALUES (?,?,?,?,?,?)'
+    );
+    for (const i of items) ins.run(q.id, i.description, i.unit, i.qty, i.price, round2(i.price * i.qty));
+    db.prepare(
+      "UPDATE quotes SET status = 'quoted', quoted_at = datetime('now'), valid_until = ?, admin_note = ? WHERE id = ?"
+    ).run(validUntil, String(req.body.admin_note || '').trim().slice(0, 500), q.id);
+  })();
+  flash(req, 'success', `Quote sent: ${V.rm(quoteTotal(q.id))}, valid until ${fmtDay(validUntil)}.`);
+  res.redirect(`/admin/quotes/${q.id}`);
+});
+
+app.post('/admin/quotes/:id/decline', requireAdmin, (req, res) => {
+  const q = getQuote(req.params.id);
+  if (!q) return res.status(404).send('Quote not found');
+  if (q.status === 'accepted' || q.status === 'declined') {
+    flash(req, 'error', 'This quote has already been decided.');
+    return res.redirect(`/admin/quotes/${q.id}`);
+  }
+  const reason = String(req.body.reason || '').trim().slice(0, 300);
+  if (!reason) {
+    flash(req, 'error', 'Give the customer a reason.');
+    return res.redirect(`/admin/quotes/${q.id}`);
+  }
+  db.prepare("UPDATE quotes SET status = 'declined', decline_reason = ?, decided_at = datetime('now') WHERE id = ?")
+    .run(reason, q.id);
+  flash(req, 'success', 'Quote request declined.');
+  res.redirect(`/admin/quotes/${q.id}`);
+});
+
 // ---------- invoice (customer owner or admin) ----------
 
 app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
@@ -969,6 +1504,7 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
     </tbody>
     <tfoot>
       <tr><td colspan="4" class="num total-label">Subtotal</td><td class="num">${V.rm(order.subtotal)}</td></tr>
+      ${order.is_express ? `<tr><td colspan="4" class="num total-label">Rush Order Surcharge (${order.express_percent}%)</td><td class="num">${V.rm(order.express_amount)}</td></tr>` : ''}
       ${order.sst_percent > 0 ? `<tr><td colspan="4" class="num total-label">SST (${order.sst_percent}%)</td><td class="num">${V.rm(order.sst_amount)}</td></tr>` : ''}
       <tr><td colspan="4" class="num total-label"><strong>TOTAL</strong></td><td class="num inv-total"><strong>${V.rm(order.total)}</strong></td></tr>
       ${order.credit_applied > 0 ? `<tr><td colspan="4" class="num total-label">Store Credit Applied</td><td class="num">- ${V.rm(order.credit_applied)}</td></tr>` : ''}
@@ -995,9 +1531,24 @@ app.get('/files/:id', (req, res) => {
   if (!user) return res.redirect('/login');
   const f = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.id);
   if (!f) return res.status(404).send('File not found');
-  const order = getOrder(f.order_id);
-  if (user.role !== 'admin' && order.customer_id !== user.id) return res.status(404).send('File not found');
+  if (user.role !== 'admin') {
+    const owner = f.order_id
+      ? getOrder(f.order_id)
+      : f.quote_id
+        ? db.prepare('SELECT customer_id FROM quotes WHERE id = ?').get(f.quote_id)
+        : null;
+    if (!owner || owner.customer_id !== user.id) return res.status(404).send('File not found');
+  }
   res.download(path.join(UPLOAD_DIR, f.stored_name), f.original_name);
+});
+
+// Artwork template download (any logged-in user).
+app.get('/products/:id/template', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login');
+  const p = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
+  if (!p || !p.template_stored) return res.status(404).send('No template for this product');
+  res.download(path.join(UPLOAD_DIR, p.template_stored), p.template_name || 'template');
 });
 
 // ---------- admin: orders ----------
@@ -1028,6 +1579,7 @@ app.get('/admin', requireAdmin, (req, res) => {
   const pendingByOrder = Object.fromEntries(pendingPayments.map((p) => [p.order_id, p.n]));
   for (const o of orders) {
     if (pendingByOrder[o.id]) o.action_note = `${pendingByOrder[o.id]} payment(s) to verify`;
+    else if (o.status === 'confirmed' && o.proof_status === 'changes') o.action_note = 'Proof changes requested — send revised proof';
     else if (o.status === 'cancelled' && o.refund_status === '' && paidFor(o) > 0) o.action_note = 'Payment to resolve';
   }
 
@@ -1042,9 +1594,11 @@ app.get('/admin', requireAdmin, (req, res) => {
     .all()
     .reduce((s, r) => s + r.n, 0);
 
+  const quoteRequests = db.prepare("SELECT COUNT(*) AS n FROM quotes WHERE status = 'requested'").get().n;
   const stats = `<div class="stat-row">
     <div class="stat-card"><span class="stat-num">${unverified}</span><span class="stat-label">Awaiting verification</span></div>
     <div class="stat-card"><span class="stat-num">${pendingPayCount}</span><span class="stat-label">Payments to verify</span></div>
+    <div class="stat-card"><a href="/admin/quotes?status=requested" class="stat-link"><span class="stat-num">${quoteRequests}</span><span class="stat-label">Quote requests</span></a></div>
     <div class="stat-card"><span class="stat-num">${counts.confirmed || 0}</span><span class="stat-label">In production</span></div>
     <div class="stat-card"><span class="stat-num">${counts.completed || 0}</span><span class="stat-label">Ready / to deliver</span></div>
     <div class="stat-card"><span class="stat-num">${V.rm(sales)}</span><span class="stat-label">Total order value</span></div>
@@ -1202,6 +1756,7 @@ app.get('/admin/orders/:id', requireAdmin, (req, res) => {
     ${artworkCard(order, { isAdmin: true })}
     ${paymentsCard(order, { isAdmin: true })}
   </div>
+  ${proofSection(order, { isAdmin: true })}
   ${verifySection}
   ${deliveryProof}
   ${commentsSection(order, `/admin/orders/${order.id}/comment`)}
@@ -1341,6 +1896,59 @@ app.post('/admin/orders/:id/resolve-payment', requireAdmin, (req, res) => {
   res.redirect(`/admin/orders/${order.id}`);
 });
 
+// Admin uploads a digital proof; the customer must approve it before production can finish.
+app.post('/admin/orders/:id/proof', requireAdmin, runUpload(uploadProofFile), (req, res) => {
+  const order = getOrder(req.params.id);
+  if (!order) return res.status(404).send('Order not found');
+  if (order.status !== 'confirmed') {
+    flash(req, 'error', 'Proofs are sent on confirmed orders, before production is completed.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  if (!req.file) {
+    flash(req, 'error', 'No file selected.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  db.prepare('INSERT INTO files (order_id, kind, stored_name, original_name, size) VALUES (?,?,?,?,?)').run(
+    order.id, 'proof', req.file.filename, req.file.originalname, req.file.size
+  );
+  db.prepare("UPDATE orders SET proof_status = 'pending', proof_note = '' WHERE id = ?").run(order.id);
+  logEvent(order.id, req.user, 'proof_sent', req.file.originalname);
+  flash(req, 'success', 'Proof sent. The customer must approve it before the order can be marked complete.');
+  res.redirect(`/admin/orders/${order.id}`);
+});
+
+app.post('/orders/:id/proof-approve', requireCustomer, (req, res) => {
+  const order = getOrder(req.params.id);
+  if (!order || order.customer_id !== req.user.id) return res.status(404).send('Order not found');
+  if (order.proof_status !== 'pending') {
+    flash(req, 'error', 'There is no proof awaiting your approval.');
+    return res.redirect(`/orders/${order.id}`);
+  }
+  db.prepare("UPDATE orders SET proof_status = 'approved', proof_decided_at = datetime('now') WHERE id = ?").run(order.id);
+  logEvent(order.id, req.user, 'proof_approved', '');
+  flash(req, 'success', 'Proof approved. Production will proceed — thank you!');
+  res.redirect(`/orders/${order.id}`);
+});
+
+app.post('/orders/:id/proof-changes', requireCustomer, (req, res) => {
+  const order = getOrder(req.params.id);
+  if (!order || order.customer_id !== req.user.id) return res.status(404).send('Order not found');
+  if (order.proof_status !== 'pending') {
+    flash(req, 'error', 'There is no proof awaiting your approval.');
+    return res.redirect(`/orders/${order.id}`);
+  }
+  const note = String(req.body.note || '').trim().slice(0, 500);
+  if (!note) {
+    flash(req, 'error', 'Please describe what should be changed.');
+    return res.redirect(`/orders/${order.id}`);
+  }
+  db.prepare("UPDATE orders SET proof_status = 'changes', proof_note = ?, proof_decided_at = datetime('now') WHERE id = ?")
+    .run(note, order.id);
+  logEvent(order.id, req.user, 'proof_changes', note);
+  flash(req, 'success', 'Change request sent. We will upload a revised proof.');
+  res.redirect(`/orders/${order.id}`);
+});
+
 app.post('/admin/orders/:id/delivery-proof', requireAdmin, runUpload(uploadDelivery), (req, res) => {
   const order = getOrder(req.params.id);
   if (!order) return res.status(404).send('Order not found');
@@ -1387,6 +1995,13 @@ app.post('/admin/orders/:id/status', requireAdmin, (req, res) => {
     logEvent(order.id, req.user, 'confirmed', `Estimated ready ${fmtDay(eta)}`);
     flash(req, 'success', `Order ${order.order_no} confirmed. Estimated ready: ${fmtDay(eta)}.`);
   } else if (action === 'complete' && order.status === 'confirmed') {
+    // Rule: once a proof has been sent, the customer must approve it before production can be completed.
+    if (order.proof_status === 'pending' || order.proof_status === 'changes') {
+      flash(req, 'error', order.proof_status === 'pending'
+        ? 'Cannot mark as complete: the digital proof is still awaiting the customer\'s approval.'
+        : 'Cannot mark as complete: the customer requested changes to the proof. Upload a revised proof first.');
+      return res.redirect(`/admin/orders/${order.id}`);
+    }
     db.prepare("UPDATE orders SET status = 'completed', completed_at = datetime('now') WHERE id = ?").run(order.id);
     logEvent(order.id, req.user, 'completed', '');
     flash(req, 'success', `Order ${order.order_no} marked as complete.`);
@@ -1471,7 +2086,7 @@ app.get('/admin/products', requireAdmin, (req, res) => {
   const products = db.prepare('SELECT * FROM products ORDER BY active DESC, name').all();
   const rows = products
     .map(
-      (p) => `<form method="post" action="/admin/products/${p.id}" class="product-row card ${p.active ? '' : 'inactive'}">
+      (p) => `<form method="post" action="/admin/products/${p.id}" enctype="multipart/form-data" class="product-row card ${p.active ? '' : 'inactive'}">
       <div class="grid-fields">
         <label>Name<input name="name" value="${V.esc(p.name)}" required></label>
         <label>Unit<input name="unit" value="${V.esc(p.unit)}" required></label>
@@ -1482,6 +2097,8 @@ app.get('/admin/products', requireAdmin, (req, res) => {
       <label>Artwork requirements (shown to customers)<input name="artwork_spec" value="${V.esc(p.artwork_spec)}" placeholder="e.g. 300dpi PNG or AI file"></label>
       <label>Bulk price tiers <span class="muted small">(format: minQty=price, e.g. 50=22.50, 100=19.90 — blank for none)</span>
         <input name="tiers" value="${V.esc(tiersText(p.id))}" placeholder="50=22.50, 100=19.90"></label>
+      <label>Artwork template file ${p.template_stored ? `<span class="muted small">(current: <a href="/products/${p.id}/template">${V.esc(p.template_name)}</a> — upload to replace)</span>` : '<span class="muted small">(customers can download this from the order form)</span>'}
+        <input type="file" name="template" accept=".zip,.pdf,.ai,.psd,.jpg,.jpeg,.png"></label>
       <div class="row-actions">
         <button class="btn btn-outline btn-sm" type="submit" name="action" value="save">Save</button>
         <button class="btn btn-ghost btn-sm" type="submit" name="action" value="${p.active ? 'deactivate' : 'activate'}">
@@ -1494,7 +2111,7 @@ app.get('/admin/products', requireAdmin, (req, res) => {
   <div class="page-head"><div><h1>Products</h1><p class="muted">Base prices apply unless a bulk tier or a customer-specific price applies. A customer-specific price always wins.</p></div></div>
   <div class="card">
     <h2>Add Product</h2>
-    <form method="post" action="/admin/products" class="stack">
+    <form method="post" action="/admin/products" enctype="multipart/form-data" class="stack">
       <div class="grid-fields">
         <label>Name<input name="name" required></label>
         <label>Unit<input name="unit" value="pcs" required></label>
@@ -1504,6 +2121,8 @@ app.get('/admin/products', requireAdmin, (req, res) => {
       <label>Description<input name="description"></label>
       <label>Artwork requirements<input name="artwork_spec" placeholder="e.g. 300dpi PNG or AI file"></label>
       <label>Bulk price tiers <span class="muted small">(minQty=price, comma separated)</span><input name="tiers" placeholder="50=22.50, 100=19.90"></label>
+      <label>Artwork template file (optional — customers can download it)
+        <input type="file" name="template" accept=".zip,.pdf,.ai,.psd,.jpg,.jpeg,.png"></label>
       <button class="btn btn-primary" type="submit">Add Product</button>
     </form>
   </div>
@@ -1521,25 +2140,30 @@ function productFieldsValid(req) {
   return { price, moq, tiers };
 }
 
-app.post('/admin/products', requireAdmin, (req, res) => {
+app.post('/admin/products', requireAdmin, runUpload(uploadTemplate), (req, res) => {
   const v = productFieldsValid(req);
   if (!v) {
+    if (req.file) fs.unlink(req.file.path, () => {});
     flash(req, 'error', 'Check the product fields: name, valid price, min order qty of at least 1, and tiers in the form 50=22.50, 100=19.90.');
     return res.redirect('/admin/products');
   }
-  const info = db.prepare('INSERT INTO products (name, description, unit, base_price, moq, artwork_spec) VALUES (?,?,?,?,?,?)').run(
+  const info = db.prepare(
+    'INSERT INTO products (name, description, unit, base_price, moq, artwork_spec, template_stored, template_name) VALUES (?,?,?,?,?,?,?,?)'
+  ).run(
     String(req.body.name).trim().slice(0, 200),
     String(req.body.description || '').trim().slice(0, 500),
     String(req.body.unit || 'pcs').trim().slice(0, 30),
     v.price, v.moq,
-    String(req.body.artwork_spec || '').trim().slice(0, 300)
+    String(req.body.artwork_spec || '').trim().slice(0, 300),
+    req.file ? req.file.filename : '',
+    req.file ? req.file.originalname : ''
   );
   saveTiers(info.lastInsertRowid, v.tiers);
   flash(req, 'success', 'Product added.');
   res.redirect('/admin/products');
 });
 
-app.post('/admin/products/:id', requireAdmin, (req, res) => {
+app.post('/admin/products/:id', requireAdmin, runUpload(uploadTemplate), (req, res) => {
   const p = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
   if (!p) return res.status(404).send('Product not found');
   if (req.body.action === 'deactivate' || req.body.action === 'activate') {
@@ -1548,6 +2172,7 @@ app.post('/admin/products/:id', requireAdmin, (req, res) => {
   } else {
     const v = productFieldsValid(req);
     if (!v) {
+      if (req.file) fs.unlink(req.file.path, () => {});
       flash(req, 'error', 'Check the product fields: name, valid price, min order qty of at least 1, and tiers in the form 50=22.50, 100=19.90.');
       return res.redirect('/admin/products');
     }
@@ -1559,6 +2184,10 @@ app.post('/admin/products/:id', requireAdmin, (req, res) => {
       String(req.body.artwork_spec || '').trim().slice(0, 300),
       p.id
     );
+    if (req.file) {
+      db.prepare('UPDATE products SET template_stored = ?, template_name = ? WHERE id = ?')
+        .run(req.file.filename, req.file.originalname, p.id);
+    }
     saveTiers(p.id, v.tiers);
     flash(req, 'success', 'Product updated.');
   }
@@ -1630,6 +2259,10 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
           <input name="lead_days" type="number" step="1" min="0" max="60" value="${V.esc(setting('lead_days', '3'))}"></label>
         <label>Deposit % to confirm <span class="muted small">(100 = full payment before production)</span>
           <input name="deposit_percent" type="number" step="1" min="0" max="100" value="${V.esc(setting('deposit_percent', '50'))}"></label>
+        <label>Rush order surcharge % <span class="muted small">(0 = rush orders off)</span>
+          <input name="express_percent" type="number" step="1" min="0" max="100" value="${V.esc(setting('express_percent', '20'))}"></label>
+        <label>Rush order lead time (days) <span class="muted small">(must be shorter than normal lead time)</span>
+          <input name="express_lead_days" type="number" step="1" min="0" max="30" value="${V.esc(setting('express_lead_days', '1'))}"></label>
       </div>
       <button class="btn btn-primary" type="submit">Save Settings</button>
     </form>
@@ -1642,10 +2275,14 @@ app.post('/admin/settings', requireAdmin, (req, res) => {
   const sst = parseFloat(req.body.sst_percent);
   const lead = parseInt(req.body.lead_days, 10);
   const dep = parseFloat(req.body.deposit_percent);
+  const expPct = parseFloat(req.body.express_percent);
+  const expDays = parseInt(req.body.express_lead_days, 10);
   setSetting('whatsapp', wa);
   setSetting('sst_percent', isNaN(sst) || sst < 0 ? '0' : String(Math.min(sst, 50)));
   setSetting('lead_days', isNaN(lead) || lead < 0 ? '3' : String(Math.min(lead, 60)));
   setSetting('deposit_percent', isNaN(dep) || dep < 0 ? '50' : String(Math.min(dep, 100)));
+  setSetting('express_percent', isNaN(expPct) || expPct < 0 ? '0' : String(Math.min(expPct, 100)));
+  setSetting('express_lead_days', isNaN(expDays) || expDays < 0 ? '1' : String(Math.min(expDays, 30)));
   flash(req, 'success', 'Settings saved. SST, lead time and deposit apply to new orders / future confirmations.');
   res.redirect('/admin/customers');
 });

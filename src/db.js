@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS users (
   name TEXT NOT NULL,
   company TEXT DEFAULT '',
   phone TEXT DEFAULT '',
+  address TEXT DEFAULT '',
   active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -31,6 +32,8 @@ CREATE TABLE IF NOT EXISTS products (
   base_price REAL NOT NULL DEFAULT 0,
   moq INTEGER NOT NULL DEFAULT 1,
   artwork_spec TEXT DEFAULT '',
+  template_stored TEXT DEFAULT '',
+  template_name TEXT DEFAULT '',
   active INTEGER NOT NULL DEFAULT 1
 );
 
@@ -56,6 +59,9 @@ CREATE TABLE IF NOT EXISTS orders (
   status TEXT NOT NULL DEFAULT 'submitted'
     CHECK (status IN ('submitted','needs_revision','confirmed','completed','delivered','cancelled')),
   subtotal REAL NOT NULL DEFAULT 0,
+  is_express INTEGER NOT NULL DEFAULT 0,
+  express_percent REAL NOT NULL DEFAULT 0,
+  express_amount REAL NOT NULL DEFAULT 0,
   sst_percent REAL NOT NULL DEFAULT 0,
   sst_amount REAL NOT NULL DEFAULT 0,
   total REAL NOT NULL DEFAULT 0,
@@ -70,6 +76,10 @@ CREATE TABLE IF NOT EXISTS orders (
   eta_date TEXT DEFAULT '',
   cancel_reason TEXT DEFAULT '',
   revision_reason TEXT DEFAULT '',
+  proof_status TEXT NOT NULL DEFAULT '' CHECK (proof_status IN ('','pending','approved','changes')),
+  proof_note TEXT DEFAULT '',
+  proof_decided_at TEXT,
+  quote_id INTEGER REFERENCES quotes(id),
   refund_status TEXT NOT NULL DEFAULT '' CHECK (refund_status IN ('','refunded','credited')),
   refund_ref TEXT DEFAULT '',
   refund_note TEXT DEFAULT '',
@@ -87,7 +97,7 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE TABLE IF NOT EXISTS order_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   order_id INTEGER NOT NULL REFERENCES orders(id),
-  product_id INTEGER NOT NULL REFERENCES products(id),
+  product_id INTEGER REFERENCES products(id),
   product_name TEXT NOT NULL,
   unit TEXT NOT NULL,
   qty INTEGER NOT NULL,
@@ -95,10 +105,40 @@ CREATE TABLE IF NOT EXISTS order_items (
   line_total REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS quotes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  quote_no TEXT NOT NULL UNIQUE,
+  customer_id INTEGER NOT NULL REFERENCES users(id),
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  ref_link TEXT DEFAULT '',
+  needed_by TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'requested'
+    CHECK (status IN ('requested','quoted','accepted','declined')),
+  valid_until TEXT DEFAULT '',
+  admin_note TEXT DEFAULT '',
+  decline_reason TEXT DEFAULT '',
+  order_id INTEGER REFERENCES orders(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  quoted_at TEXT,
+  decided_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS quote_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  quote_id INTEGER NOT NULL REFERENCES quotes(id),
+  description TEXT NOT NULL,
+  unit TEXT NOT NULL DEFAULT 'pcs',
+  qty INTEGER NOT NULL,
+  unit_price REAL NOT NULL,
+  line_total REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  order_id INTEGER NOT NULL REFERENCES orders(id),
-  kind TEXT NOT NULL CHECK (kind IN ('artwork','receipt','delivery')),
+  order_id INTEGER REFERENCES orders(id),
+  quote_id INTEGER REFERENCES quotes(id),
+  kind TEXT NOT NULL CHECK (kind IN ('artwork','receipt','delivery','proof','quote_ref')),
   stored_name TEXT NOT NULL,
   original_name TEXT NOT NULL,
   size INTEGER NOT NULL DEFAULT 0,
@@ -158,9 +198,15 @@ function ensureColumn(table, column, ddl) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
   if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
 }
+ensureColumn('users', 'address', "address TEXT DEFAULT ''");
 ensureColumn('products', 'moq', 'moq INTEGER NOT NULL DEFAULT 1');
 ensureColumn('products', 'artwork_spec', "artwork_spec TEXT DEFAULT ''");
+ensureColumn('products', 'template_stored', "template_stored TEXT DEFAULT ''");
+ensureColumn('products', 'template_name', "template_name TEXT DEFAULT ''");
 ensureColumn('orders', 'subtotal', 'subtotal REAL NOT NULL DEFAULT 0');
+ensureColumn('orders', 'is_express', 'is_express INTEGER NOT NULL DEFAULT 0');
+ensureColumn('orders', 'express_percent', 'express_percent REAL NOT NULL DEFAULT 0');
+ensureColumn('orders', 'express_amount', 'express_amount REAL NOT NULL DEFAULT 0');
 ensureColumn('orders', 'sst_percent', 'sst_percent REAL NOT NULL DEFAULT 0');
 ensureColumn('orders', 'sst_amount', 'sst_amount REAL NOT NULL DEFAULT 0');
 ensureColumn('orders', 'credit_applied', 'credit_applied REAL NOT NULL DEFAULT 0');
@@ -172,10 +218,15 @@ ensureColumn('orders', 'eta_date', "eta_date TEXT DEFAULT ''");
 ensureColumn('orders', 'cancel_reason', "cancel_reason TEXT DEFAULT ''");
 ensureColumn('orders', 'cancelled_at', 'cancelled_at TEXT');
 ensureColumn('orders', 'revision_reason', "revision_reason TEXT DEFAULT ''");
+ensureColumn('orders', 'proof_status', "proof_status TEXT NOT NULL DEFAULT ''");
+ensureColumn('orders', 'proof_note', "proof_note TEXT DEFAULT ''");
+ensureColumn('orders', 'proof_decided_at', 'proof_decided_at TEXT');
+ensureColumn('orders', 'quote_id', 'quote_id INTEGER REFERENCES quotes(id)');
 ensureColumn('orders', 'refund_status', "refund_status TEXT NOT NULL DEFAULT ''");
 ensureColumn('orders', 'refund_ref', "refund_ref TEXT DEFAULT ''");
 ensureColumn('orders', 'refund_note', "refund_note TEXT DEFAULT ''");
 ensureColumn('orders', 'refund_resolved_at', 'refund_resolved_at TEXT');
+ensureColumn('files', 'quote_id', 'quote_id INTEGER REFERENCES quotes(id)');
 
 // ---- seed ----
 const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
@@ -223,15 +274,23 @@ function setSetting(key, value) {
 if (!db.prepare("SELECT value FROM settings WHERE key = 'invoice_seq'").get()) {
   setSetting('invoice_seq', '10000');
 }
+if (setting('quote_seq', null) === null) setSetting('quote_seq', '5000');
 if (setting('sst_percent', null) === null) setSetting('sst_percent', '0');
 if (setting('lead_days', null) === null) setSetting('lead_days', '3');
 if (setting('whatsapp', null) === null) setSetting('whatsapp', '');
 if (setting('deposit_percent', null) === null) setSetting('deposit_percent', '50');
+if (setting('express_percent', null) === null) setSetting('express_percent', '20');
+if (setting('express_lead_days', null) === null) setSetting('express_lead_days', '1');
 
 function nextInvoiceNo() {
   const next = parseInt(setting('invoice_seq', '10000'), 10) + 1;
   setSetting('invoice_seq', next);
   return next;
+}
+function nextQuoteNo() {
+  const next = parseInt(setting('quote_seq', '5000'), 10) + 1;
+  setSetting('quote_seq', next);
+  return `QUO-${next}`;
 }
 
 function tiersFor(productId) {
@@ -276,6 +335,6 @@ function logEvent(orderId, actor, event, note) {
 }
 
 module.exports = {
-  db, nextInvoiceNo, priceFor, tiersFor, setting, setSetting,
+  db, nextInvoiceNo, nextQuoteNo, priceFor, tiersFor, setting, setSetting,
   paidFor, creditBalance, logEvent,
 };
