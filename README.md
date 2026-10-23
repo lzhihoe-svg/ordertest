@@ -25,15 +25,29 @@ A mobile/tablet/desktop-friendly order portal for Aramega Textile Sdn Bhd custom
 - Portal settings: WhatsApp number, SST %, production lead time
 - Order discussion thread, admin cancellation with reason
 
+**Payments, revisions & money handling**
+- **Payments ledger**: customers submit each payment with an amount + receipt file; admin verifies or rejects (with a reason); admin can also record bank-statement/cash payments manually. Orders show Total / Paid / Balance Due
+- **Deposit rule**: a configurable deposit % (default 50%) in verified payments is required before an order can be confirmed; **full payment is required before delivery**
+- **Revision requests**: instead of cancelling a problematic order, admin sends it back as *Revision Requested* with a reason; the customer fixes artwork and **resubmits**
+- **Cancelled-with-payment resolution**: if a cancelled order has verified payments, admin must resolve it — record a **bank refund** (with transfer ref) or convert it to **store credit**
+- **Store credit**: credited amounts live on the customer's account and can be applied automatically to the next order (counts toward the deposit)
+- **Order history log**: every event (submit, revision, payments, confirm, cancel, refund, delivery proof) is recorded with actor and time, visible on the order
+- **Delivery proof**: admin uploads the DO / delivery photo to the order
+- **Customer account page**: credit balance + self-service password change
+- **CSV export** of all orders (with paid/balance figures) for accounting
+
 **Enforced business rules**
 1. An order **cannot be submitted without artwork** — a .zip upload or a WeTransfer link is mandatory (client + server validated)
 2. Quantities must meet each product's **minimum order quantity**
 3. Needed-by date must respect the configurable **production lead time**
 4. **Courier delivery requires an address**; marking a courier order delivered requires a **tracking number**
-5. Admin cannot tick "payment received" without an uploaded receipt or a bank reference number
-6. Confirming an order requires all 3 verification checks **and an estimated ready date**
-7. Customers can cancel (with a reason) **only before confirmation**; admin can cancel before completion
-8. SST % and lead time are snapshotted per order — changing settings never alters old invoices
+5. A customer payment submission requires an **amount + receipt file**, and cannot exceed the balance due
+6. Admin cannot tick "payment received" (or confirm) until **verified payments cover the deposit %**
+7. Confirming an order requires all 3 verification checks **and an estimated ready date**; the deposit is re-checked at confirm time
+8. **Full payment before delivery** — a courier order additionally needs a tracking number
+9. Rejecting a payment requires a reason (shown to the customer); a bank refund requires the transfer reference
+10. Customers can cancel (with a reason) **only before confirmation**; admin can cancel before completion; money on a cancelled order must be resolved (refund or credit) exactly once
+11. SST %, deposit % and lead time are snapshotted/validated per order — changing settings never alters old invoices
 
 ## Run
 

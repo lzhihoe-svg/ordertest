@@ -6,7 +6,10 @@ const session = require('express-session');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 
-const { db, nextInvoiceNo, priceFor, tiersFor, setting, setSetting } = require('./src/db');
+const {
+  db, nextInvoiceNo, priceFor, tiersFor, setting, setSetting,
+  paidFor, creditBalance, logEvent,
+} = require('./src/db');
 const V = require('./src/views');
 
 const app = express();
@@ -81,9 +84,23 @@ function getFiles(orderId, kind) {
 function getComments(orderId) {
   return db.prepare('SELECT * FROM comments WHERE order_id = ? ORDER BY id').all(orderId);
 }
+function getPayments(orderId) {
+  return db
+    .prepare(`SELECT p.*, f.original_name AS file_name, f.id AS file_id2
+              FROM payments p LEFT JOIN files f ON f.id = p.file_id
+              WHERE p.order_id = ? ORDER BY p.id`)
+    .all(orderId);
+}
+function getLog(orderId) {
+  return db.prepare('SELECT * FROM status_log WHERE order_id = ? ORDER BY id').all(orderId);
+}
 
 function round2(n) {
   return Math.round(n * 100) / 100;
+}
+function depositRequired(order) {
+  const pct = parseFloat(setting('deposit_percent', '50')) || 0;
+  return round2((order.total * Math.min(Math.max(pct, 0), 100)) / 100);
 }
 
 // Today in Kuala Lumpur as YYYY-MM-DD, plus N days.
@@ -119,14 +136,12 @@ const uploadArtwork = multer({
   },
 }).single('artwork');
 
-const uploadReceipt = multer({
-  storage,
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB
-  fileFilter: (req, file, cb) => {
-    if (/\.(pdf|jpe?g|png|webp)$/i.test(file.originalname)) return cb(null, true);
-    cb(new Error('Receipt must be a PDF or image file (pdf, jpg, png, webp).'));
-  },
-}).single('receipt');
+const docFilter = (req, file, cb) => {
+  if (/\.(pdf|jpe?g|png|webp)$/i.test(file.originalname)) return cb(null, true);
+  cb(new Error('File must be a PDF or image (pdf, jpg, png, webp).'));
+};
+const uploadReceipt = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 }, fileFilter: docFilter }).single('receipt');
+const uploadDelivery = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 }, fileFilter: docFilter }).single('proof');
 
 function runUpload(middleware) {
   return (req, res, next) =>
@@ -134,7 +149,7 @@ function runUpload(middleware) {
       if (err) {
         const msg =
           err.code === 'LIMIT_FILE_SIZE'
-            ? 'File is too large. Artwork zip max 500MB, receipt max 20MB.'
+            ? 'File is too large. Artwork zip max 500MB, documents max 20MB.'
             : err.message || 'Upload failed.';
         flash(req, 'error', msg);
         return res.redirect(req.get('referer') || '/');
@@ -152,6 +167,56 @@ const fileCard = (f) => `
     <a href="/files/${f.id}" class="file-link">&#128206; ${V.esc(f.original_name)}</a>
     <span class="muted">${f.size >= 1024 * 1024 ? (f.size / 1024 / 1024).toFixed(2) + ' MB' : Math.max(1, Math.round(f.size / 1024)) + ' KB'} &middot; ${V.esc(V.fmtDate(f.uploaded_at))}</span>
   </li>`;
+
+const payChip = (s) =>
+  s === 'verified' ? '<span class="badge badge-completed">Verified</span>'
+  : s === 'rejected' ? '<span class="badge badge-cancelled">Rejected</span>'
+  : '<span class="badge badge-submitted">Pending Review</span>';
+
+function paymentSummary(order) {
+  const paid = paidFor(order);
+  const balance = round2(order.total - paid);
+  const dep = depositRequired(order);
+  const pct = setting('deposit_percent', '50');
+  return `<div class="pay-summary">
+    <div><span class="muted small">Order Total</span><strong>${V.rm(order.total)}</strong></div>
+    ${order.credit_applied > 0 ? `<div><span class="muted small">Store Credit Applied</span><strong>${V.rm(order.credit_applied)}</strong></div>` : ''}
+    <div><span class="muted small">Paid (verified)</span><strong>${V.rm(paid)}</strong></div>
+    <div class="${balance > 0 ? 'pay-due' : 'pay-ok'}"><span class="muted small">Balance Due</span><strong>${V.rm(Math.max(balance, 0))}</strong></div>
+    ${order.status === 'submitted' || order.status === 'needs_revision'
+      ? `<div><span class="muted small">Deposit to confirm (${V.esc(pct)}%)</span><strong>${V.rm(dep)}</strong></div>` : ''}
+  </div>`;
+}
+
+function paymentsList(order, { isAdmin }) {
+  const payments = getPayments(order.id);
+  if (!payments.length) return '<p class="muted">No payments recorded yet.</p>';
+  return `<ul class="pay-list">${payments
+    .map(
+      (p) => `<li class="pay-row">
+      <div class="pay-row-main">
+        <strong>${V.rm(p.amount)}</strong> ${payChip(p.status)}
+        <span class="muted small">${V.esc(V.fmtDate(p.created_at))}${p.source === 'admin' ? ' &middot; recorded by admin' : ''}</span>
+      </div>
+      <div class="muted small">
+        ${p.bank_ref ? `Ref: <strong>${V.esc(p.bank_ref)}</strong> ` : ''}
+        ${p.file_id ? `&middot; <a href="/files/${p.file_id}">receipt file</a>` : ''}
+        ${p.note ? `&middot; ${V.esc(p.note)}` : ''}
+      </div>
+      ${isAdmin && p.status === 'pending' ? `
+      <div class="pay-actions">
+        <form method="post" action="/admin/orders/${order.id}/payments/${p.id}/verify" class="inline-form">
+          <button class="btn btn-primary btn-sm" type="submit">Verify Payment</button>
+        </form>
+        <form method="post" action="/admin/orders/${order.id}/payments/${p.id}/reject" class="inline-form">
+          <input name="note" placeholder="Reason (shown to customer)" required>
+          <button class="btn btn-danger btn-sm" type="submit">Reject</button>
+        </form>
+      </div>` : ''}
+    </li>`
+    )
+    .join('')}</ul>`;
+}
 
 function commentsSection(order, postUrl) {
   const comments = getComments(order.id);
@@ -176,7 +241,33 @@ function commentsSection(order, postUrl) {
   </div>`;
 }
 
-function deliveryCard(order) {
+function historySection(order) {
+  const log = getLog(order.id);
+  if (!log.length) return '';
+  const EVENTS = {
+    submitted: 'Order submitted', resubmitted: 'Order resubmitted after revision',
+    revision_requested: 'Revision requested', confirmed: 'Order confirmed',
+    completed: 'Order marked complete', delivered: 'Order delivered',
+    cancelled: 'Order cancelled', payment_submitted: 'Payment submitted',
+    payment_recorded: 'Payment recorded', payment_verified: 'Payment verified',
+    payment_rejected: 'Payment rejected', refund_resolved: 'Payment resolution',
+    delivery_proof: 'Delivery proof uploaded',
+  };
+  return `
+  <div class="card">
+    <h2>Order History</h2>
+    <ul class="history-list">${log
+      .map(
+        (l) => `<li><span class="muted small">${V.esc(V.fmtDate(l.created_at))}</span>
+        <strong>${V.esc(EVENTS[l.event] || l.event)}</strong>
+        <span class="muted small">by ${V.esc(l.actor_name)}${l.actor_role === 'admin' ? ' (Aramega)' : ''}</span>
+        ${l.note ? `<div class="muted small">${V.esc(l.note)}</div>` : ''}</li>`
+      )
+      .join('')}</ul>
+  </div>`;
+}
+
+function deliveryCard(order, deliveryFiles) {
   return `
   <div class="card">
     <h2>Delivery</h2>
@@ -187,10 +278,13 @@ function deliveryCard(order) {
       <tr><td>Estimated ready</td><td>${order.eta_date ? V.esc(fmtDay(order.eta_date)) : '<span class="muted">Set when the order is confirmed</span>'}</td></tr>
       ${order.tracking_no ? `<tr><td>Tracking No</td><td><strong>${V.esc(order.tracking_no)}</strong></td></tr>` : ''}
     </table>
+    ${deliveryFiles && deliveryFiles.length ? `
+    <h3 class="sub-h">Delivery Proof / DO</h3>
+    <ul class="file-list">${deliveryFiles.map((f) => fileCard(f)).join('')}</ul>` : ''}
   </div>`;
 }
 
-// ---------- auth ----------
+// ---------- auth & account ----------
 
 app.get('/login', (req, res) => {
   const user = currentUser(req);
@@ -212,15 +306,61 @@ app.post('/logout', (req, res) => {
   req.session.destroy(() => res.redirect('/login'));
 });
 
+app.get('/account', requireCustomer, (req, res) => {
+  const credit = creditBalance(req.user.id);
+  const body = `
+  <div class="page-head"><div><h1>My Account</h1><p class="muted">${V.esc(req.user.name)} &middot; ${V.esc(req.user.company)}</p></div></div>
+  <div class="grid-2">
+    <div class="card">
+      <h2>Store Credit</h2>
+      <p class="credit-big">${V.rm(credit)}</p>
+      <p class="muted small">Credit from cancelled orders can be applied to your next order at checkout.</p>
+    </div>
+    <div class="card">
+      <h2>Change Password</h2>
+      <form method="post" action="/account/password" class="stack">
+        <label>Current password<input type="password" name="current" required autocomplete="current-password"></label>
+        <label>New password (min 6 characters)<input type="password" name="password" minlength="6" required autocomplete="new-password"></label>
+        <label>Repeat new password<input type="password" name="password2" minlength="6" required autocomplete="new-password"></label>
+        <button class="btn btn-primary" type="submit">Update Password</button>
+      </form>
+    </div>
+  </div>`;
+  render(req, res, { title: 'My Account', user: req.user, body, active: 'account' });
+});
+
+app.post('/account/password', requireCustomer, (req, res) => {
+  const { current, password, password2 } = req.body;
+  if (!bcrypt.compareSync(String(current || ''), req.user.password_hash)) {
+    flash(req, 'error', 'Your current password is incorrect.');
+  } else if (String(password || '').length < 6) {
+    flash(req, 'error', 'New password must be at least 6 characters.');
+  } else if (password !== password2) {
+    flash(req, 'error', 'The new passwords do not match.');
+  } else {
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(password, 10), req.user.id);
+    flash(req, 'success', 'Password updated.');
+  }
+  res.redirect('/account');
+});
+
 // ---------- customer: dashboard ----------
 
 app.get('/', requireCustomer, (req, res) => {
   const orders = db
     .prepare('SELECT * FROM orders WHERE customer_id = ? ORDER BY id DESC')
     .all(req.user.id);
+  for (const o of orders) {
+    if (o.status === 'needs_revision') o.action_note = 'Action needed: revise and resubmit';
+    else if (['submitted', 'confirmed', 'completed'].includes(o.status)) {
+      const balance = round2(o.total - paidFor(o));
+      if (balance > 0) o.action_note = `Balance due: ${V.rm(balance)}`;
+    }
+  }
+  const credit = creditBalance(req.user.id);
   const body = `
   <div class="page-head">
-    <div><h1>My Orders</h1><p class="muted">Welcome back, ${V.esc(req.user.name)}.</p></div>
+    <div><h1>My Orders</h1><p class="muted">Welcome back, ${V.esc(req.user.name)}.${credit > 0 ? ` You have <strong>${V.rm(credit)}</strong> store credit.` : ''}</p></div>
     <a class="btn btn-primary" href="/orders/new">+ New Order</a>
   </div>
   ${V.ordersTable(orders)}`;
@@ -233,6 +373,7 @@ app.get('/orders/new', requireCustomer, (req, res) => {
   const products = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY name').all();
   const leadDays = parseInt(setting('lead_days', '3'), 10);
   const minDate = klDatePlus(leadDays);
+  const credit = creditBalance(req.user.id);
 
   // Prefill quantities when re-ordering a previous order.
   const prefill = {};
@@ -273,9 +414,11 @@ app.get('/orders/new', requireCustomer, (req, res) => {
     .join('');
 
   const sst = parseFloat(setting('sst_percent', '0'));
+  const depositPct = setting('deposit_percent', '50');
   const body = `
   <div class="page-head"><div><h1>New Order</h1>
-  <p class="muted">Select products and quantities. Your invoice is generated automatically when you submit.</p></div></div>
+  <p class="muted">Select products and quantities. Your invoice is generated automatically when you submit.
+  A ${V.esc(depositPct)}% deposit is required before production starts; full payment before delivery.</p></div></div>
   <form method="post" action="/orders" enctype="multipart/form-data" id="order-form" class="stack">
     <div class="card">
       <h2>1. Products &amp; Quantity</h2>
@@ -317,8 +460,15 @@ app.get('/orders/new', requireCustomer, (req, res) => {
       </label>
       <p class="muted small">Earliest available date is ${V.esc(fmtDay(minDate))} (production lead time: ${leadDays} days).</p>
     </div>
+    ${credit > 0 ? `
+    <div class="card credit-card">
+      <h2>4. Store Credit</h2>
+      <label class="check"><input type="checkbox" name="use_credit" value="1" checked>
+        Apply my store credit (<strong>${V.rm(credit)}</strong> available) to this order</label>
+      <p class="muted small">Credit is applied up to the order total; any remainder stays in your account.</p>
+    </div>` : ''}
     <div class="card">
-      <h2>4. Notes (optional)</h2>
+      <h2>${credit > 0 ? '5' : '4'}. Notes (optional)</h2>
       <label>Order notes
         <textarea name="notes" rows="3" placeholder="Sizes breakdown, colours, delivery instructions..."></textarea>
       </label>
@@ -432,17 +582,24 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
   const sstAmount = round2((subtotal * sstPercent) / 100);
   const total = round2(subtotal + sstAmount);
 
+  // Store credit: apply up to the order total if the customer opted in.
+  let creditApplied = 0;
+  if (req.body.use_credit) {
+    creditApplied = Math.min(creditBalance(req.user.id), total);
+    creditApplied = round2(Math.max(creditApplied, 0));
+  }
+
   const orderId = db.transaction(() => {
     const invNum = nextInvoiceNo();
     const info = db
       .prepare(
         `INSERT INTO orders (order_no, invoice_no, customer_id, subtotal, sst_percent, sst_amount, total,
-          notes, wetransfer_link, delivery_method, delivery_address, needed_by)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+          credit_applied, notes, wetransfer_link, delivery_method, delivery_address, needed_by)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
         `ORD-${invNum}`, `INV-${invNum}`, req.user.id, subtotal, sstPercent, sstAmount, total,
-        String(req.body.notes || '').slice(0, 2000), wetransfer, method, address, neededBy
+        creditApplied, String(req.body.notes || '').slice(0, 2000), wetransfer, method, address, neededBy
       );
     const id = info.lastInsertRowid;
     const insItem = db.prepare(
@@ -455,6 +612,12 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
         id, 'artwork', req.file.filename, req.file.originalname, req.file.size
       );
     }
+    if (creditApplied > 0) {
+      db.prepare('INSERT INTO credits (customer_id, amount, order_id, note) VALUES (?,?,?,?)').run(
+        req.user.id, -creditApplied, id, `Credit applied to ORD-${invNum}`
+      );
+    }
+    logEvent(id, req.user, 'submitted', creditApplied > 0 ? `Store credit applied: ${V.rm(creditApplied)}` : '');
     return id;
   })();
 
@@ -464,12 +627,9 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
 
 // ---------- customer: order detail ----------
 
-function orderDetailBody(order, { isAdmin }) {
+function itemsCard(order, notesLabel) {
   const items = getItems(order.id);
-  const artwork = getFiles(order.id, 'artwork');
-  const receipts = getFiles(order.id, 'receipt');
-
-  const itemsTable = `<div class="table-wrap"><table class="table">
+  return `<div class="card"><h2>Items</h2><div class="table-wrap"><table class="table">
     <thead><tr><th>Product</th><th class="num">Unit Price</th><th class="num">Qty</th><th class="num">Subtotal</th></tr></thead>
     <tbody>${items
       .map(
@@ -485,18 +645,21 @@ function orderDetailBody(order, { isAdmin }) {
       ${order.sst_percent > 0 ? `<tr><td colspan="3" class="num total-label">SST (${order.sst_percent}%)</td><td class="num">${V.rm(order.sst_amount)}</td></tr>` : ''}
       <tr><td colspan="3" class="num total-label"><strong>Total</strong></td><td class="num"><strong>${V.rm(order.total)}</strong></td></tr>
     </tfoot>
-  </table></div>`;
+  </table></div>
+  ${order.notes ? `<p class="muted"><strong>${notesLabel}:</strong> ${V.esc(order.notes)}</p>` : ''}</div>`;
+}
 
-  const canEdit = !isAdmin && (order.status === 'submitted' || order.status === 'confirmed');
-
-  const artworkSection = `
+function artworkCard(order, { isAdmin }) {
+  const artwork = getFiles(order.id, 'artwork');
+  const canEdit = !isAdmin && (order.status === 'submitted' || order.status === 'needs_revision');
+  return `
   <div class="card">
     <h2>Artwork</h2>
     ${artwork.length ? `<ul class="file-list">${artwork.map((f) => fileCard(f)).join('')}</ul>` : ''}
     ${order.wetransfer_link ? `<p>WeTransfer link: <a href="${V.esc(order.wetransfer_link)}" target="_blank" rel="noopener noreferrer">${V.esc(order.wetransfer_link)}</a></p>` : ''}
     ${!artwork.length && !order.wetransfer_link ? '<p class="muted">No artwork provided yet.</p>' : ''}
-    ${!isAdmin && order.status === 'submitted' ? `
-    <details class="upload-details">
+    ${canEdit ? `
+    <details class="upload-details" ${order.status === 'needs_revision' ? 'open' : ''}>
       <summary>Upload / replace artwork</summary>
       <form method="post" action="/orders/${order.id}/artwork" enctype="multipart/form-data" class="stack">
         <label>Artwork zip file (max 500MB)
@@ -513,31 +676,77 @@ function orderDetailBody(order, { isAdmin }) {
       </form>
     </details>` : ''}
   </div>`;
+}
 
-  const receiptSection = `
+function paymentsCard(order, { isAdmin }) {
+  const canPay = !isAdmin && ['submitted', 'needs_revision', 'confirmed', 'completed'].includes(order.status);
+  return `
   <div class="card">
-    <h2>Payment Proof (Bank Receipt)</h2>
-    ${receipts.length ? `<ul class="file-list">${receipts.map((f) => fileCard(f)).join('')}</ul>` : '<p class="muted">No receipt uploaded yet.</p>'}
-    ${order.payment_ref ? `<p>Bank reference: <strong>${V.esc(order.payment_ref)}</strong></p>` : ''}
-    ${canEdit ? `
-    <form method="post" action="/orders/${order.id}/receipt" enctype="multipart/form-data" class="stack">
-      <label>Receipt file (PDF or image, max 20MB)
-        <input type="file" name="receipt" accept=".pdf,.jpg,.jpeg,.png,.webp" required>
-      </label>
-      <label>Bank reference number (optional)
-        <input name="payment_ref" value="${V.esc(order.payment_ref)}" placeholder="e.g. CIMB ref no.">
-      </label>
-      <button class="btn btn-outline" type="submit">Upload Receipt</button>
-    </form>` : ''}
+    <h2>Payments</h2>
+    ${paymentSummary(order)}
+    ${paymentsList(order, { isAdmin })}
+    ${canPay ? `
+    <details class="upload-details">
+      <summary>Submit a payment</summary>
+      <form method="post" action="/orders/${order.id}/payment" enctype="multipart/form-data" class="stack">
+        <label>Amount paid (RM) <span class="req-chip">Required</span>
+          <input name="amount" type="number" step="0.01" min="0.01" required placeholder="e.g. 500.00">
+        </label>
+        <label>Receipt file (PDF or image, max 20MB) <span class="req-chip">Required</span>
+          <input type="file" name="receipt" accept=".pdf,.jpg,.jpeg,.png,.webp" required>
+        </label>
+        <label>Bank reference number (optional)
+          <input name="bank_ref" placeholder="e.g. CIMB ref no.">
+        </label>
+        <button class="btn btn-outline" type="submit">Submit Payment for Verification</button>
+      </form>
+    </details>` : ''}
+    ${isAdmin && order.status !== 'cancelled' && order.status !== 'delivered' ? `
+    <details class="upload-details">
+      <summary>Record a payment manually (bank statement / cash)</summary>
+      <form method="post" action="/admin/orders/${order.id}/payments" class="stack">
+        <label>Amount (RM)<input name="amount" type="number" step="0.01" min="0.01" required></label>
+        <label>Bank reference / note <span class="req-chip">Required</span>
+          <input name="bank_ref" required placeholder="e.g. CIMB statement ref, or CASH"></label>
+        <button class="btn btn-outline" type="submit">Record Verified Payment</button>
+      </form>
+    </details>` : ''}
   </div>`;
+}
 
-  return { itemsTable, artworkSection, receiptSection };
+function refundBanner(order, { isAdmin }) {
+  if (order.status !== 'cancelled') return '';
+  const paid = paidFor(order);
+  if (order.refund_status === 'refunded') {
+    return `<div class="flash">Payment of ${V.rm(paid)} on this cancelled order was <strong>refunded</strong>${order.refund_ref ? ` (ref: ${V.esc(order.refund_ref)})` : ''} on ${V.esc(V.fmtDate(order.refund_resolved_at))}.${order.refund_note ? ' ' + V.esc(order.refund_note) : ''}</div>`;
+  }
+  if (order.refund_status === 'credited') {
+    return `<div class="flash">Payment of ${V.rm(paid)} on this cancelled order was converted to <strong>store credit</strong> on ${V.esc(V.fmtDate(order.refund_resolved_at))}. It will be applied automatically on the next order.</div>`;
+  }
+  if (paid > 0) {
+    return isAdmin
+      ? `<div class="card verify-card">
+          <h2>Resolve Customer Payment <span class="req-chip">Action needed</span></h2>
+          <p>The customer has <strong>${V.rm(paid)}</strong> in verified payments/credit on this cancelled order. Choose how to resolve it:</p>
+          <form method="post" action="/admin/orders/${order.id}/resolve-payment" class="stack">
+            <div class="radio-row">
+              <label class="check"><input type="radio" name="mode" value="credit" checked> Convert to store credit</label>
+              <label class="check"><input type="radio" name="mode" value="refund"> Refunded by bank transfer</label>
+            </div>
+            <label>Bank transfer reference (required for refund)
+              <input name="refund_ref" placeholder="e.g. CIMB transfer ref"></label>
+            <label>Note (optional)<input name="note" maxlength="300"></label>
+            <button class="btn btn-primary" type="submit">Resolve Payment</button>
+          </form>
+        </div>`
+      : `<div class="flash err">This order was cancelled with ${V.rm(paid)} already paid. Our team will contact you to refund it or convert it to store credit — see Order Discussion below.</div>`;
+  }
+  return '';
 }
 
 app.get('/orders/:id', requireCustomer, (req, res) => {
   const order = getOrder(req.params.id);
   if (!order || order.customer_id !== req.user.id) return res.status(404).send('Order not found');
-  const { itemsTable, artworkSection, receiptSection } = orderDetailBody(order, { isAdmin: false });
   const body = `
   <div class="page-head">
     <div><h1>Order ${V.esc(order.order_no)}</h1><p class="muted">Placed ${V.esc(V.fmtDate(order.created_at))}</p></div>
@@ -547,21 +756,31 @@ app.get('/orders/:id', requireCustomer, (req, res) => {
       <a class="btn btn-outline" href="/orders/new?reorder=${order.id}">Re-order</a>
     </div>
   </div>
+  ${order.status === 'needs_revision' ? `
+  <div class="card revision-card">
+    <h2>Revision Requested <span class="req-chip">Action needed</span></h2>
+    <p><strong>Our team found an issue with this order:</strong> ${V.esc(order.revision_reason)}</p>
+    <p class="muted small">Fix the issue below (replace the artwork zip, update the WeTransfer link, or reply in the discussion), then resubmit the order for checking.</p>
+    <form method="post" action="/orders/${order.id}/resubmit">
+      <button class="btn btn-primary" type="submit">I have fixed it &mdash; Resubmit Order</button>
+    </form>
+  </div>` : ''}
+  ${refundBanner(order, { isAdmin: false })}
   <div class="card"><h2>Order Status</h2>${V.timeline(order)}</div>
   <div class="grid-2">
-    <div class="card"><h2>Items</h2>${itemsTable}
-      ${order.notes ? `<p class="muted"><strong>Notes:</strong> ${V.esc(order.notes)}</p>` : ''}</div>
-    ${deliveryCard(order)}
+    ${itemsCard(order, 'Notes')}
+    ${deliveryCard(order, getFiles(order.id, 'delivery'))}
   </div>
   ${order.status !== 'cancelled' ? `<div class="grid-2">
-    ${artworkSection}
-    ${receiptSection}
+    ${artworkCard(order, { isAdmin: false })}
+    ${paymentsCard(order, { isAdmin: false })}
   </div>` : ''}
   ${commentsSection(order, `/orders/${order.id}/comment`)}
+  ${historySection(order)}
   ${order.status === 'submitted' ? `
   <div class="card cancel-card">
     <h2>Cancel Order</h2>
-    <p class="muted small">You can cancel this order while it is still awaiting confirmation. Once our team confirms it and production starts, cancellation is no longer possible from here — contact us instead.</p>
+    <p class="muted small">You can cancel this order while it is still awaiting confirmation. Once our team confirms it and production starts, cancellation is no longer possible from here — contact us instead. Any verified payment will be refunded or converted to store credit.</p>
     <form method="post" action="/orders/${order.id}/cancel" class="stack"
       onsubmit="return confirm('Are you sure you want to cancel this order? This cannot be undone.')">
       <label>Reason for cancellation <span class="req-chip">Required</span>
@@ -576,8 +795,8 @@ app.get('/orders/:id', requireCustomer, (req, res) => {
 app.post('/orders/:id/artwork', requireCustomer, runUpload(uploadArtwork), (req, res) => {
   const order = getOrder(req.params.id);
   if (!order || order.customer_id !== req.user.id) return res.status(404).send('Order not found');
-  if (order.status !== 'submitted') {
-    flash(req, 'error', 'Artwork can only be changed while the order is awaiting confirmation.');
+  if (order.status !== 'submitted' && order.status !== 'needs_revision') {
+    flash(req, 'error', 'Artwork can only be changed while the order is awaiting confirmation or revision.');
     return res.redirect(`/orders/${order.id}`);
   }
   if (!req.file) {
@@ -594,8 +813,8 @@ app.post('/orders/:id/artwork', requireCustomer, runUpload(uploadArtwork), (req,
 app.post('/orders/:id/wetransfer', requireCustomer, (req, res) => {
   const order = getOrder(req.params.id);
   if (!order || order.customer_id !== req.user.id) return res.status(404).send('Order not found');
-  if (order.status !== 'submitted') {
-    flash(req, 'error', 'Artwork can only be changed while the order is awaiting confirmation.');
+  if (order.status !== 'submitted' && order.status !== 'needs_revision') {
+    flash(req, 'error', 'Artwork can only be changed while the order is awaiting confirmation or revision.');
     return res.redirect(`/orders/${order.id}`);
   }
   const link = String(req.body.wetransfer_link || '').trim().slice(0, 500);
@@ -608,23 +827,51 @@ app.post('/orders/:id/wetransfer', requireCustomer, (req, res) => {
   res.redirect(`/orders/${order.id}`);
 });
 
-app.post('/orders/:id/receipt', requireCustomer, runUpload(uploadReceipt), (req, res) => {
+// Customer submits a payment with amount + receipt; it goes to admin for verification.
+app.post('/orders/:id/payment', requireCustomer, runUpload(uploadReceipt), (req, res) => {
   const order = getOrder(req.params.id);
   if (!order || order.customer_id !== req.user.id) return res.status(404).send('Order not found');
-  if (order.status === 'cancelled' || order.status === 'delivered') {
-    flash(req, 'error', 'Receipts can no longer be added to this order.');
+  const bad = (msg) => {
+    if (req.file) fs.unlink(req.file.path, () => {});
+    flash(req, 'error', msg);
+    return res.redirect(`/orders/${order.id}`);
+  };
+  if (!['submitted', 'needs_revision', 'confirmed', 'completed'].includes(order.status)) {
+    return bad('Payments can no longer be added to this order.');
+  }
+  const amount = round2(parseFloat(req.body.amount));
+  if (isNaN(amount) || amount <= 0) return bad('Enter the amount you paid (greater than 0).');
+  // Rule: a payment submission must include the receipt file as proof.
+  if (!req.file) return bad('Please attach your bank receipt file.');
+  const balance = round2(order.total - paidFor(order));
+  if (amount > balance + 0.005) {
+    return bad(`That amount (${V.rm(amount)}) is more than the balance due (${V.rm(balance)}). Enter the correct amount, or contact us if you overpaid.`);
+  }
+  const ref = String(req.body.bank_ref || '').trim().slice(0, 200);
+  db.transaction(() => {
+    const fInfo = db
+      .prepare('INSERT INTO files (order_id, kind, stored_name, original_name, size) VALUES (?,?,?,?,?)')
+      .run(order.id, 'receipt', req.file.filename, req.file.originalname, req.file.size);
+    db.prepare(
+      "INSERT INTO payments (order_id, amount, bank_ref, status, source, file_id) VALUES (?,?,?,'pending','customer',?)"
+    ).run(order.id, amount, ref, fInfo.lastInsertRowid);
+    logEvent(order.id, req.user, 'payment_submitted', `${V.rm(amount)}${ref ? ' ref ' + ref : ''}`);
+  })();
+  flash(req, 'success', `Payment of ${V.rm(amount)} submitted. Our team will verify it shortly.`);
+  res.redirect(`/orders/${order.id}`);
+});
+
+// Customer resubmits after fixing a revision request.
+app.post('/orders/:id/resubmit', requireCustomer, (req, res) => {
+  const order = getOrder(req.params.id);
+  if (!order || order.customer_id !== req.user.id) return res.status(404).send('Order not found');
+  if (order.status !== 'needs_revision') {
+    flash(req, 'error', 'This order is not waiting for a revision.');
     return res.redirect(`/orders/${order.id}`);
   }
-  if (!req.file) {
-    flash(req, 'error', 'No file selected.');
-    return res.redirect(`/orders/${order.id}`);
-  }
-  db.prepare('INSERT INTO files (order_id, kind, stored_name, original_name, size) VALUES (?,?,?,?,?)').run(
-    order.id, 'receipt', req.file.filename, req.file.originalname, req.file.size
-  );
-  const ref = String(req.body.payment_ref || '').trim().slice(0, 200);
-  if (ref) db.prepare('UPDATE orders SET payment_ref = ? WHERE id = ?').run(ref, order.id);
-  flash(req, 'success', 'Receipt uploaded. Our team will verify your payment.');
+  db.prepare("UPDATE orders SET status = 'submitted' WHERE id = ?").run(order.id);
+  logEvent(order.id, req.user, 'resubmitted', '');
+  flash(req, 'success', 'Order resubmitted. Our team will check it again.');
   res.redirect(`/orders/${order.id}`);
 });
 
@@ -643,6 +890,7 @@ app.post('/orders/:id/cancel', requireCustomer, (req, res) => {
   }
   db.prepare("UPDATE orders SET status = 'cancelled', cancelled_at = datetime('now'), cancel_reason = ? WHERE id = ?")
     .run(reason, order.id);
+  logEvent(order.id, req.user, 'cancelled', reason);
   flash(req, 'success', `Order ${order.order_no} has been cancelled.`);
   res.redirect(`/orders/${order.id}`);
 });
@@ -667,6 +915,8 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
   if (!order) return res.status(404).send('Order not found');
   if (user.role !== 'admin' && order.customer_id !== user.id) return res.status(404).send('Order not found');
   const items = getItems(order.id);
+  const paid = paidFor(order);
+  const balance = round2(order.total - paid);
   const customerLabel = order.customer_company || order.customer_name;
   const pdfName = `${order.invoice_no} - ${customerLabel} - ${V.rm(order.total).replace('RM ', 'RM')}`;
   res.send(`<!doctype html>
@@ -696,7 +946,7 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
         <tr><td>Date</td><td>${V.esc(V.fmtDate(order.created_at))}</td></tr>
         <tr><td>Needed by</td><td>${V.esc(fmtDay(order.needed_by))}</td></tr>
         <tr><td>Delivery</td><td>${order.delivery_method === 'courier' ? 'Courier' : 'Self Pickup'}</td></tr>
-        <tr><td>Status</td><td>${order.chk_payment ? '<strong class="paid">PAYMENT RECEIVED</strong>' : '<strong class="unpaid">AWAITING PAYMENT</strong>'}</td></tr>
+        <tr><td>Status</td><td>${balance <= 0 ? '<strong class="paid">PAID IN FULL</strong>' : paid > 0 ? `<strong class="unpaid">PARTIALLY PAID (${V.rm(paid)})</strong>` : '<strong class="unpaid">AWAITING PAYMENT</strong>'}</td></tr>
       </table>
     </div>
   </header>
@@ -721,6 +971,9 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
       <tr><td colspan="4" class="num total-label">Subtotal</td><td class="num">${V.rm(order.subtotal)}</td></tr>
       ${order.sst_percent > 0 ? `<tr><td colspan="4" class="num total-label">SST (${order.sst_percent}%)</td><td class="num">${V.rm(order.sst_amount)}</td></tr>` : ''}
       <tr><td colspan="4" class="num total-label"><strong>TOTAL</strong></td><td class="num inv-total"><strong>${V.rm(order.total)}</strong></td></tr>
+      ${order.credit_applied > 0 ? `<tr><td colspan="4" class="num total-label">Store Credit Applied</td><td class="num">- ${V.rm(order.credit_applied)}</td></tr>` : ''}
+      ${paid > 0 ? `<tr><td colspan="4" class="num total-label">Paid</td><td class="num">${V.rm(paid)}</td></tr>
+      <tr><td colspan="4" class="num total-label"><strong>BALANCE DUE</strong></td><td class="num inv-total"><strong>${V.rm(Math.max(balance, 0))}</strong></td></tr>` : ''}
     </tfoot>
   </table>
   <section class="inv-payinfo">
@@ -728,7 +981,7 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
     <p>Bank Name: CIMB<br>
     Beneficiary Name: Aramega Textile Sdn Bhd<br>
     Account Number: 8605494198</p>
-    <p class="muted small">Orders are processed only after payment is received and verified. Please upload your bank receipt on the order page after making payment.</p>
+    <p class="muted small">A ${V.esc(setting('deposit_percent', '50'))}% deposit is required before production starts; full payment is required before delivery. Please upload your bank receipt on the order page after making payment.</p>
   </section>
 </div>
 </body>
@@ -752,7 +1005,7 @@ app.get('/files/:id', (req, res) => {
 app.get('/admin', requireAdmin, (req, res) => {
   const filter = String(req.query.status || '');
   const q = String(req.query.q || '').trim();
-  const allStatuses = [...V.STATUS_ORDER, 'cancelled'];
+  const allStatuses = ['submitted', 'needs_revision', 'confirmed', 'completed', 'delivered', 'cancelled'];
   const valid = allStatuses.includes(filter);
   const where = [];
   const params = [];
@@ -769,15 +1022,29 @@ app.get('/admin', requireAdmin, (req, res) => {
        ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY o.id DESC`
     )
     .all(...params);
+  const pendingPayments = db
+    .prepare("SELECT order_id, COUNT(*) AS n FROM payments WHERE status = 'pending' GROUP BY order_id")
+    .all();
+  const pendingByOrder = Object.fromEntries(pendingPayments.map((p) => [p.order_id, p.n]));
+  for (const o of orders) {
+    if (pendingByOrder[o.id]) o.action_note = `${pendingByOrder[o.id]} payment(s) to verify`;
+    else if (o.status === 'cancelled' && o.refund_status === '' && paidFor(o) > 0) o.action_note = 'Payment to resolve';
+  }
 
   const counts = {};
   for (const r of db.prepare('SELECT status, COUNT(*) AS n FROM orders GROUP BY status').all()) counts[r.status] = r.n;
   const totalCount = Object.values(counts).reduce((a, b) => a + b, 0);
   const sales = db.prepare("SELECT COALESCE(SUM(total),0) AS s FROM orders WHERE status != 'cancelled'").get().s;
-  const unverified = db.prepare("SELECT COUNT(*) AS n FROM orders WHERE status = 'submitted'").get().n;
+  const unverified = (counts.submitted || 0) + (counts.needs_revision || 0);
+  const pendingPayCount = db.prepare("SELECT COUNT(*) AS n FROM payments WHERE status = 'pending'").get().n;
+  const toResolve = db
+    .prepare("SELECT COUNT(*) AS n FROM orders WHERE status = 'cancelled' AND refund_status = ''")
+    .all()
+    .reduce((s, r) => s + r.n, 0);
 
   const stats = `<div class="stat-row">
     <div class="stat-card"><span class="stat-num">${unverified}</span><span class="stat-label">Awaiting verification</span></div>
+    <div class="stat-card"><span class="stat-num">${pendingPayCount}</span><span class="stat-label">Payments to verify</span></div>
     <div class="stat-card"><span class="stat-num">${counts.confirmed || 0}</span><span class="stat-label">In production</span></div>
     <div class="stat-card"><span class="stat-num">${counts.completed || 0}</span><span class="stat-label">Ready / to deliver</span></div>
     <div class="stat-card"><span class="stat-num">${V.rm(sales)}</span><span class="stat-label">Total order value</span></div>
@@ -794,6 +1061,7 @@ app.get('/admin', requireAdmin, (req, res) => {
     <input name="q" value="${V.esc(q)}" placeholder="Search order no, invoice no or customer...">
     <button class="btn btn-outline" type="submit">Search</button>
     ${q ? `<a class="btn btn-ghost" href="/admin">Clear</a>` : ''}
+    <a class="btn btn-ghost" href="/admin/export.csv">Export CSV</a>
   </form>`;
   const body = `
   <div class="page-head"><div><h1>All Orders</h1><p class="muted">Review, verify and update customer orders.</p></div></div>
@@ -803,12 +1071,38 @@ app.get('/admin', requireAdmin, (req, res) => {
   render(req, res, { title: 'Admin - Orders', user: req.user, body, active: 'orders' });
 });
 
+app.get('/admin/export.csv', requireAdmin, (req, res) => {
+  const orders = db
+    .prepare(
+      `SELECT o.*, u.name AS customer_name, u.company AS customer_company
+       FROM orders o JOIN users u ON u.id = o.customer_id ORDER BY o.id`
+    )
+    .all();
+  const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+  const head = ['Order No', 'Invoice No', 'Customer', 'Company', 'Status', 'Created', 'Subtotal', 'SST %', 'SST', 'Total',
+    'Credit Applied', 'Paid (verified)', 'Balance Due', 'Delivery', 'Needed By', 'ETA', 'Tracking No', 'Refund Resolution'];
+  const lines = [head.map(esc).join(',')];
+  for (const o of orders) {
+    const paid = paidFor(o);
+    lines.push([
+      o.order_no, o.invoice_no, o.customer_name, o.customer_company, V.STATUS[o.status].label, o.created_at,
+      o.subtotal.toFixed(2), o.sst_percent, o.sst_amount.toFixed(2), o.total.toFixed(2),
+      o.credit_applied.toFixed(2), paid.toFixed(2), Math.max(round2(o.total - paid), 0).toFixed(2),
+      o.delivery_method, o.needed_by, o.eta_date, o.tracking_no, o.refund_status,
+    ].map(esc).join(','));
+  }
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="aramega-orders-${klDatePlus(0)}.csv"`);
+  res.send('﻿' + lines.join('\r\n'));
+});
+
 app.get('/admin/orders/:id', requireAdmin, (req, res) => {
   const order = getOrder(req.params.id);
   if (!order) return res.status(404).send('Order not found');
-  const { itemsTable, artworkSection, receiptSection } = orderDetailBody(order, { isAdmin: true });
   const allChecked = order.chk_artwork && order.chk_product && order.chk_payment;
-  const receipts = getFiles(order.id, 'receipt');
+  const paid = paidFor(order);
+  const balance = round2(order.total - paid);
+  const dep = depositRequired(order);
   const minEta = klDatePlus(0);
 
   let actionBtn = '';
@@ -820,15 +1114,18 @@ app.get('/admin/orders/:id', requireAdmin, (req, res) => {
       <button class="btn btn-primary btn-lg" type="submit" name="action" value="confirm" ${allChecked ? '' : 'disabled'}>
       Confirm Order</button>
       ${allChecked ? '' : '<p class="muted small">Complete all three verification checks (and save) to enable confirmation.</p>'}`;
+  } else if (order.status === 'needs_revision') {
+    actionBtn = `<p class="muted">Waiting for the customer to fix the issue and resubmit. Reason sent: <strong>${V.esc(order.revision_reason)}</strong></p>`;
   } else if (order.status === 'confirmed') {
     actionBtn = `<button class="btn btn-primary btn-lg" type="submit" name="action" value="complete">Mark as Order Complete</button>`;
   } else if (order.status === 'completed') {
     actionBtn = `
+      ${balance > 0 ? `<p class="muted small"><strong>Balance due: ${V.rm(balance)}.</strong> Full payment is required before the order can be marked as delivered.</p>` : ''}
       ${order.delivery_method === 'courier' ? `
       <label>Courier tracking number <span class="req-chip">Required for courier delivery</span>
         <input name="tracking_no" value="${V.esc(order.tracking_no)}" required placeholder="e.g. J&amp;T / GDEX tracking no.">
       </label>` : ''}
-      <button class="btn btn-primary btn-lg" type="submit" name="action" value="deliver">Mark as Delivered</button>`;
+      <button class="btn btn-primary btn-lg" type="submit" name="action" value="deliver" ${balance > 0 ? 'disabled' : ''}>Mark as Delivered</button>`;
   } else if (order.status === 'delivered') {
     actionBtn = `<p class="muted">This order has been delivered. Nothing further to do.</p>`;
   } else {
@@ -845,17 +1142,23 @@ app.get('/admin/orders/:id', requireAdmin, (req, res) => {
         Product &amp; quantity checked and correct</label>
       <label class="check"><input type="checkbox" name="chk_payment" ${order.chk_payment ? 'checked' : ''}>
         Payment received and verified
-        ${!receipts.length && !order.payment_ref ? '<span class="req-chip">needs a receipt or bank ref</span>' : ''}</label>
-      <label>Bank reference number
-        <input name="payment_ref" value="${V.esc(order.payment_ref)}" placeholder="e.g. CIMB ref no.">
-      </label>
+        ${paid < dep ? `<span class="req-chip">needs ${V.rm(dep)} verified (deposit) &mdash; currently ${V.rm(paid)}</span>` : ''}</label>
       <button class="btn btn-outline" type="submit">Save Verification</button>
     </form>
+    ${order.status === 'submitted' ? `
+    <hr class="divider">
+    <h3 class="sub-h">Found a problem? Send it back instead of cancelling</h3>
+    <form method="post" action="/admin/orders/${order.id}/request-revision" class="stack">
+      <label>What must the customer fix? <span class="req-chip">Required</span>
+        <input name="reason" required maxlength="300" placeholder="e.g. artwork is low resolution — please re-upload at 300dpi">
+      </label>
+      <button class="btn btn-outline" type="submit">Request Revision from Customer</button>
+    </form>` : ''}
     <hr class="divider">
     <form method="post" action="/admin/orders/${order.id}/status" class="stack">
       ${actionBtn}
     </form>
-    ${order.status === 'submitted' || order.status === 'confirmed' ? `
+    ${['submitted', 'needs_revision', 'confirmed'].includes(order.status) ? `
     <hr class="divider">
     <details>
       <summary class="muted">Cancel this order (admin)</summary>
@@ -864,8 +1167,21 @@ app.get('/admin/orders/:id', requireAdmin, (req, res) => {
         <label>Reason <input name="reason" required maxlength="300" placeholder="Reason shown to the customer"></label>
         <button class="btn btn-danger" type="submit">Cancel Order</button>
       </form>
+      <p class="muted small">If the customer has verified payments, you will be asked to refund or convert them to store credit after cancelling.</p>
     </details>` : ''}
   </div>`;
+
+  const deliveryProof = ['completed', 'delivered'].includes(order.status) ? `
+  <div class="card">
+    <h2>Delivery Proof / DO</h2>
+    ${getFiles(order.id, 'delivery').length ? `<ul class="file-list">${getFiles(order.id, 'delivery').map((f) => fileCard(f)).join('')}</ul>` : '<p class="muted">No delivery proof uploaded yet.</p>'}
+    <form method="post" action="/admin/orders/${order.id}/delivery-proof" enctype="multipart/form-data" class="stack">
+      <label>Upload DO / delivery photo (PDF or image, max 20MB)
+        <input type="file" name="proof" accept=".pdf,.jpg,.jpeg,.png,.webp" required>
+      </label>
+      <button class="btn btn-outline" type="submit">Upload Delivery Proof</button>
+    </form>
+  </div>` : '';
 
   const body = `
   <div class="page-head">
@@ -876,42 +1192,171 @@ app.get('/admin/orders/:id', requireAdmin, (req, res) => {
       <a class="btn btn-outline" href="/admin/orders/${order.id}/invoice" target="_blank">View Invoice</a>
     </div>
   </div>
+  ${refundBanner(order, { isAdmin: true })}
   <div class="card"><h2>Order Status</h2>${V.timeline(order)}</div>
   <div class="grid-2">
-    <div class="card"><h2>Items</h2>${itemsTable}
-      ${order.notes ? `<p class="muted"><strong>Customer notes:</strong> ${V.esc(order.notes)}</p>` : ''}</div>
-    ${deliveryCard(order)}
+    ${itemsCard(order, 'Customer notes')}
+    ${deliveryCard(order, getFiles(order.id, 'delivery'))}
   </div>
   <div class="grid-2">
-    ${artworkSection}
-    ${receiptSection}
+    ${artworkCard(order, { isAdmin: true })}
+    ${paymentsCard(order, { isAdmin: true })}
   </div>
   ${verifySection}
-  ${commentsSection(order, `/admin/orders/${order.id}/comment`)}`;
+  ${deliveryProof}
+  ${commentsSection(order, `/admin/orders/${order.id}/comment`)}
+  ${historySection(order)}`;
   render(req, res, { title: `Admin - ${order.order_no}`, user: req.user, body, active: 'orders' });
 });
 
 app.post('/admin/orders/:id/checks', requireAdmin, (req, res) => {
   const order = getOrder(req.params.id);
   if (!order) return res.status(404).send('Order not found');
-  const payRef = String(req.body.payment_ref || '').trim().slice(0, 200);
-  // Rule: "payment received" can only be ticked when there is proof —
-  // an uploaded receipt or a bank reference number.
-  const hasReceipt = getFiles(order.id, 'receipt').length > 0;
-  if (req.body.chk_payment && !hasReceipt && !payRef) {
-    flash(req, 'error', 'Cannot mark payment as received: there is no receipt uploaded and no bank reference number. Enter the bank reference or wait for the customer\'s receipt.');
+  // Rule: "payment received" can only be ticked once verified payments (plus credit)
+  // cover at least the required deposit.
+  const paid = paidFor(order);
+  const dep = depositRequired(order);
+  if (req.body.chk_payment && paid + 0.005 < dep) {
+    flash(req, 'error', `Cannot mark payment as received: verified payments are ${V.rm(paid)} but the required deposit is ${V.rm(dep)}. Verify the customer's payment first (Payments section).`);
     return res.redirect(`/admin/orders/${order.id}`);
   }
-  db.prepare(
-    'UPDATE orders SET chk_artwork = ?, chk_product = ?, chk_payment = ?, payment_ref = ? WHERE id = ?'
-  ).run(
+  db.prepare('UPDATE orders SET chk_artwork = ?, chk_product = ?, chk_payment = ? WHERE id = ?').run(
     req.body.chk_artwork ? 1 : 0,
     req.body.chk_product ? 1 : 0,
     req.body.chk_payment ? 1 : 0,
-    payRef,
     order.id
   );
   flash(req, 'success', 'Verification saved.');
+  res.redirect(`/admin/orders/${order.id}`);
+});
+
+// Admin sends the order back to the customer with a reason instead of cancelling.
+app.post('/admin/orders/:id/request-revision', requireAdmin, (req, res) => {
+  const order = getOrder(req.params.id);
+  if (!order) return res.status(404).send('Order not found');
+  if (order.status !== 'submitted') {
+    flash(req, 'error', 'Revisions can only be requested on submitted orders.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  const reason = String(req.body.reason || '').trim().slice(0, 300);
+  if (!reason) {
+    flash(req, 'error', 'Tell the customer what they need to fix.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  // The artwork check is reset — it must be re-checked after the fix.
+  db.prepare("UPDATE orders SET status = 'needs_revision', revision_reason = ?, chk_artwork = 0 WHERE id = ?")
+    .run(reason, order.id);
+  logEvent(order.id, req.user, 'revision_requested', reason);
+  flash(req, 'success', 'Revision requested. The customer sees the reason and can resubmit after fixing it.');
+  res.redirect(`/admin/orders/${order.id}`);
+});
+
+app.post('/admin/orders/:id/payments', requireAdmin, (req, res) => {
+  const order = getOrder(req.params.id);
+  if (!order) return res.status(404).send('Order not found');
+  const amount = round2(parseFloat(req.body.amount));
+  const ref = String(req.body.bank_ref || '').trim().slice(0, 200);
+  if (isNaN(amount) || amount <= 0 || !ref) {
+    flash(req, 'error', 'A positive amount and a bank reference / note are required to record a payment.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  const balance = round2(order.total - paidFor(order));
+  if (amount > balance + 0.005) {
+    flash(req, 'error', `That amount (${V.rm(amount)}) exceeds the balance due (${V.rm(balance)}).`);
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  db.prepare(
+    "INSERT INTO payments (order_id, amount, bank_ref, status, source, resolved_at) VALUES (?,?,?,'verified','admin',datetime('now'))"
+  ).run(order.id, amount, ref);
+  logEvent(order.id, req.user, 'payment_recorded', `${V.rm(amount)} ref ${ref}`);
+  flash(req, 'success', `Payment of ${V.rm(amount)} recorded as verified.`);
+  res.redirect(`/admin/orders/${order.id}`);
+});
+
+app.post('/admin/orders/:id/payments/:pid/verify', requireAdmin, (req, res) => {
+  const order = getOrder(req.params.id);
+  const p = db.prepare('SELECT * FROM payments WHERE id = ? AND order_id = ?').get(req.params.pid, req.params.id);
+  if (!order || !p) return res.status(404).send('Not found');
+  if (p.status !== 'pending') {
+    flash(req, 'error', 'This payment has already been resolved.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  db.prepare("UPDATE payments SET status = 'verified', resolved_at = datetime('now') WHERE id = ?").run(p.id);
+  logEvent(order.id, req.user, 'payment_verified', V.rm(p.amount));
+  flash(req, 'success', `Payment of ${V.rm(p.amount)} verified.`);
+  res.redirect(`/admin/orders/${order.id}`);
+});
+
+app.post('/admin/orders/:id/payments/:pid/reject', requireAdmin, (req, res) => {
+  const order = getOrder(req.params.id);
+  const p = db.prepare('SELECT * FROM payments WHERE id = ? AND order_id = ?').get(req.params.pid, req.params.id);
+  if (!order || !p) return res.status(404).send('Not found');
+  if (p.status !== 'pending') {
+    flash(req, 'error', 'This payment has already been resolved.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  const note = String(req.body.note || '').trim().slice(0, 300);
+  if (!note) {
+    flash(req, 'error', 'Give a reason for rejecting the payment (shown to the customer).');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  db.prepare("UPDATE payments SET status = 'rejected', note = ?, resolved_at = datetime('now') WHERE id = ?").run(note, p.id);
+  logEvent(order.id, req.user, 'payment_rejected', `${V.rm(p.amount)} — ${note}`);
+  flash(req, 'success', 'Payment rejected. The customer can see the reason and submit again.');
+  res.redirect(`/admin/orders/${order.id}`);
+});
+
+// Resolve verified money on a cancelled order: refund by bank, or convert to store credit.
+app.post('/admin/orders/:id/resolve-payment', requireAdmin, (req, res) => {
+  const order = getOrder(req.params.id);
+  if (!order) return res.status(404).send('Order not found');
+  const paid = paidFor(order);
+  if (order.status !== 'cancelled' || order.refund_status !== '' || paid <= 0) {
+    flash(req, 'error', 'There is nothing to resolve on this order.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  const mode = req.body.mode === 'refund' ? 'refunded' : 'credited';
+  const ref = String(req.body.refund_ref || '').trim().slice(0, 200);
+  const note = String(req.body.note || '').trim().slice(0, 300);
+  // Rule: a bank refund must carry the transfer reference.
+  if (mode === 'refunded' && !ref) {
+    flash(req, 'error', 'Enter the bank transfer reference for the refund.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  db.transaction(() => {
+    db.prepare(
+      "UPDATE orders SET refund_status = ?, refund_ref = ?, refund_note = ?, refund_resolved_at = datetime('now') WHERE id = ?"
+    ).run(mode, ref, note, order.id);
+    if (mode === 'credited') {
+      db.prepare('INSERT INTO credits (customer_id, amount, order_id, note) VALUES (?,?,?,?)').run(
+        order.customer_id, paid, order.id, `Credit from cancelled ${order.order_no}`
+      );
+    }
+    logEvent(order.id, req.user, 'refund_resolved',
+      mode === 'refunded' ? `Refunded ${V.rm(paid)} (ref ${ref})` : `Converted ${V.rm(paid)} to store credit`);
+  })();
+  flash(req, 'success', mode === 'refunded'
+    ? `Refund of ${V.rm(paid)} recorded.`
+    : `${V.rm(paid)} converted to store credit for ${order.customer_name}.`);
+  res.redirect(`/admin/orders/${order.id}`);
+});
+
+app.post('/admin/orders/:id/delivery-proof', requireAdmin, runUpload(uploadDelivery), (req, res) => {
+  const order = getOrder(req.params.id);
+  if (!order) return res.status(404).send('Order not found');
+  if (!['completed', 'delivered'].includes(order.status)) {
+    flash(req, 'error', 'Delivery proof can be added once the order is complete.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  if (!req.file) {
+    flash(req, 'error', 'No file selected.');
+    return res.redirect(`/admin/orders/${order.id}`);
+  }
+  db.prepare('INSERT INTO files (order_id, kind, stored_name, original_name, size) VALUES (?,?,?,?,?)').run(
+    order.id, 'delivery', req.file.filename, req.file.originalname, req.file.size
+  );
+  logEvent(order.id, req.user, 'delivery_proof', req.file.originalname);
+  flash(req, 'success', 'Delivery proof uploaded.');
   res.redirect(`/admin/orders/${order.id}`);
 });
 
@@ -924,6 +1369,13 @@ app.post('/admin/orders/:id/status', requireAdmin, (req, res) => {
       flash(req, 'error', 'All three verification checks must be completed before confirming.');
       return res.redirect(`/admin/orders/${order.id}`);
     }
+    // Rule: re-verify the deposit at confirmation time (a payment may have been rejected since).
+    const paid = paidFor(order);
+    const dep = depositRequired(order);
+    if (paid + 0.005 < dep) {
+      flash(req, 'error', `Cannot confirm: verified payments are ${V.rm(paid)} but the required deposit is ${V.rm(dep)}.`);
+      return res.redirect(`/admin/orders/${order.id}`);
+    }
     // Rule: confirming requires an estimated ready date for the customer.
     const eta = String(req.body.eta_date || '').trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(eta)) {
@@ -932,11 +1384,19 @@ app.post('/admin/orders/:id/status', requireAdmin, (req, res) => {
     }
     db.prepare("UPDATE orders SET status = 'confirmed', confirmed_at = datetime('now'), eta_date = ? WHERE id = ?")
       .run(eta, order.id);
+    logEvent(order.id, req.user, 'confirmed', `Estimated ready ${fmtDay(eta)}`);
     flash(req, 'success', `Order ${order.order_no} confirmed. Estimated ready: ${fmtDay(eta)}.`);
   } else if (action === 'complete' && order.status === 'confirmed') {
     db.prepare("UPDATE orders SET status = 'completed', completed_at = datetime('now') WHERE id = ?").run(order.id);
+    logEvent(order.id, req.user, 'completed', '');
     flash(req, 'success', `Order ${order.order_no} marked as complete.`);
   } else if (action === 'deliver' && order.status === 'completed') {
+    // Rule: full payment before delivery.
+    const balance = round2(order.total - paidFor(order));
+    if (balance > 0.005) {
+      flash(req, 'error', `Cannot mark as delivered: balance of ${V.rm(balance)} is still due. Full payment is required before delivery.`);
+      return res.redirect(`/admin/orders/${order.id}`);
+    }
     // Rule: courier orders need a tracking number before they can be marked delivered.
     const tracking = String(req.body.tracking_no || '').trim().slice(0, 100);
     if (order.delivery_method === 'courier' && !tracking) {
@@ -945,6 +1405,7 @@ app.post('/admin/orders/:id/status', requireAdmin, (req, res) => {
     }
     db.prepare("UPDATE orders SET status = 'delivered', delivered_at = datetime('now'), tracking_no = ? WHERE id = ?")
       .run(tracking, order.id);
+    logEvent(order.id, req.user, 'delivered', tracking ? `Tracking ${tracking}` : '');
     flash(req, 'success', `Order ${order.order_no} marked as delivered.`);
   } else {
     flash(req, 'error', 'Invalid status change.');
@@ -955,9 +1416,9 @@ app.post('/admin/orders/:id/status', requireAdmin, (req, res) => {
 app.post('/admin/orders/:id/cancel', requireAdmin, (req, res) => {
   const order = getOrder(req.params.id);
   if (!order) return res.status(404).send('Order not found');
-  // Rule: admin can cancel before production is finished (submitted or confirmed).
-  if (order.status !== 'submitted' && order.status !== 'confirmed') {
-    flash(req, 'error', 'Only submitted or confirmed orders can be cancelled.');
+  // Rule: admin can cancel before production is finished.
+  if (!['submitted', 'needs_revision', 'confirmed'].includes(order.status)) {
+    flash(req, 'error', 'Only submitted, revision or confirmed orders can be cancelled.');
     return res.redirect(`/admin/orders/${order.id}`);
   }
   const reason = String(req.body.reason || '').trim().slice(0, 300);
@@ -967,7 +1428,9 @@ app.post('/admin/orders/:id/cancel', requireAdmin, (req, res) => {
   }
   db.prepare("UPDATE orders SET status = 'cancelled', cancelled_at = datetime('now'), cancel_reason = ? WHERE id = ?")
     .run(reason, order.id);
-  flash(req, 'success', `Order ${order.order_no} cancelled.`);
+  logEvent(order.id, req.user, 'cancelled', reason);
+  const paid = paidFor(order);
+  flash(req, 'success', `Order ${order.order_no} cancelled.${paid > 0 ? ` The customer has ${V.rm(paid)} paid — resolve it as refund or store credit below.` : ''}`);
   res.redirect(`/admin/orders/${order.id}`);
 });
 
@@ -1108,10 +1571,13 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
   const customers = db.prepare("SELECT * FROM users WHERE role = 'customer' ORDER BY active DESC, name").all();
   const rows = customers
     .map(
-      (c) => `<tr class="${c.active ? '' : 'inactive'}">
+      (c) => {
+        const credit = creditBalance(c.id);
+        return `<tr class="${c.active ? '' : 'inactive'}">
       <td data-label="Name"><strong>${V.esc(c.name)}</strong><div class="muted small">${V.esc(c.company)}</div></td>
       <td data-label="Username"><code>${V.esc(c.username)}</code></td>
       <td data-label="Phone">${V.esc(c.phone || '-')}</td>
+      <td data-label="Credit" class="num">${credit > 0 ? `<strong>${V.rm(credit)}</strong>` : '-'}</td>
       <td data-label="Status">${c.active ? '<span class="badge badge-confirmed">Active</span>' : '<span class="badge">Disabled</span>'}</td>
       <td data-label="Actions" class="row-actions">
         <a class="btn btn-outline btn-sm" href="/admin/customers/${c.id}/pricing">Set Pricing</a>
@@ -1126,7 +1592,8 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
           <button class="btn btn-ghost btn-sm" type="submit">${c.active ? 'Disable' : 'Enable'}</button>
         </form>
       </td>
-    </tr>`
+    </tr>`;
+      }
     )
     .join('');
   const body = `
@@ -1148,8 +1615,8 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
     </form>
   </div>
   <div class="table-wrap"><table class="table">
-    <thead><tr><th>Customer</th><th>Username</th><th>Phone</th><th>Status</th><th>Actions</th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="5" class="muted">No customers yet.</td></tr>'}</tbody>
+    <thead><tr><th>Customer</th><th>Username</th><th>Phone</th><th class="num">Store Credit</th><th>Status</th><th>Actions</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="muted">No customers yet.</td></tr>'}</tbody>
   </table></div>
   <div class="card">
     <h2>Portal Settings</h2>
@@ -1161,6 +1628,8 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
           <input name="sst_percent" type="number" step="0.1" min="0" max="50" value="${V.esc(setting('sst_percent', '0'))}"></label>
         <label>Production lead time (days) <span class="muted small">(earliest needed-by date)</span>
           <input name="lead_days" type="number" step="1" min="0" max="60" value="${V.esc(setting('lead_days', '3'))}"></label>
+        <label>Deposit % to confirm <span class="muted small">(100 = full payment before production)</span>
+          <input name="deposit_percent" type="number" step="1" min="0" max="100" value="${V.esc(setting('deposit_percent', '50'))}"></label>
       </div>
       <button class="btn btn-primary" type="submit">Save Settings</button>
     </form>
@@ -1172,10 +1641,12 @@ app.post('/admin/settings', requireAdmin, (req, res) => {
   const wa = String(req.body.whatsapp || '').replace(/[^\d+]/g, '').slice(0, 20);
   const sst = parseFloat(req.body.sst_percent);
   const lead = parseInt(req.body.lead_days, 10);
+  const dep = parseFloat(req.body.deposit_percent);
   setSetting('whatsapp', wa);
   setSetting('sst_percent', isNaN(sst) || sst < 0 ? '0' : String(Math.min(sst, 50)));
   setSetting('lead_days', isNaN(lead) || lead < 0 ? '3' : String(Math.min(lead, 60)));
-  flash(req, 'success', 'Settings saved. SST and lead time apply to new orders only.');
+  setSetting('deposit_percent', isNaN(dep) || dep < 0 ? '50' : String(Math.min(dep, 100)));
+  flash(req, 'success', 'Settings saved. SST, lead time and deposit apply to new orders / future confirmations.');
   res.redirect('/admin/customers');
 });
 

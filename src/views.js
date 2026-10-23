@@ -2,6 +2,7 @@
 
 const STATUS = {
   submitted: { label: 'Order Submitted', step: 1 },
+  needs_revision: { label: 'Revision Requested', step: 1 },
   confirmed: { label: 'Order Confirmed', step: 2 },
   completed: { label: 'Order Complete', step: 3 },
   delivered: { label: 'Order Delivered', step: 4 },
@@ -41,7 +42,7 @@ function timeline(order) {
     return `<div class="cancel-note">This order was cancelled on ${esc(fmtDate(order.cancelled_at))}.
       ${order.cancel_reason ? `Reason: ${esc(order.cancel_reason)}` : ''}</div>`;
   }
-  const current = STATUS_ORDER.indexOf(order.status);
+  const current = order.status === 'needs_revision' ? 0 : STATUS_ORDER.indexOf(order.status);
   const dates = {
     submitted: order.created_at,
     confirmed: order.confirmed_at,
@@ -71,7 +72,8 @@ function layout({ title, user, body, flash, active = '', whatsapp = '' }) {
         <a href="/admin/customers" class="${active === 'customers' ? 'active' : ''}">Customers &amp; Pricing</a>`
       : `
         <a href="/" class="${active === 'home' ? 'active' : ''}">My Orders</a>
-        <a href="/orders/new" class="${active === 'new' ? 'active' : ''}">New Order</a>`
+        <a href="/orders/new" class="${active === 'new' ? 'active' : ''}">New Order</a>
+        <a href="/account" class="${active === 'account' ? 'active' : ''}">My Account</a>`
     : '';
   return `<!doctype html>
 <html lang="en">
@@ -163,7 +165,7 @@ ${orders.map((o) => `<tr>
   ${adminView ? `<td data-label="Customer">${esc(o.customer_name)}</td>` : ''}
   <td data-label="Date">${esc(fmtDate(o.created_at))}</td>
   <td data-label="Total" class="num">${rm(o.total)}</td>
-  <td data-label="Status">${statusBadge(o.status)}</td>
+  <td data-label="Status">${statusBadge(o.status)}${o.action_note ? `<div class="action-note">&#9888; ${esc(o.action_note)}</div>` : ''}</td>
   <td data-label=""><a class="btn btn-sm btn-outline" href="${base}${o.id}">View</a></td>
 </tr>`).join('')}
 </tbody></table></div>`;

@@ -54,11 +54,12 @@ CREATE TABLE IF NOT EXISTS orders (
   invoice_no TEXT NOT NULL UNIQUE,
   customer_id INTEGER NOT NULL REFERENCES users(id),
   status TEXT NOT NULL DEFAULT 'submitted'
-    CHECK (status IN ('submitted','confirmed','completed','delivered','cancelled')),
+    CHECK (status IN ('submitted','needs_revision','confirmed','completed','delivered','cancelled')),
   subtotal REAL NOT NULL DEFAULT 0,
   sst_percent REAL NOT NULL DEFAULT 0,
   sst_amount REAL NOT NULL DEFAULT 0,
   total REAL NOT NULL DEFAULT 0,
+  credit_applied REAL NOT NULL DEFAULT 0,
   notes TEXT DEFAULT '',
   wetransfer_link TEXT DEFAULT '',
   payment_ref TEXT DEFAULT '',
@@ -68,6 +69,11 @@ CREATE TABLE IF NOT EXISTS orders (
   needed_by TEXT DEFAULT '',
   eta_date TEXT DEFAULT '',
   cancel_reason TEXT DEFAULT '',
+  revision_reason TEXT DEFAULT '',
+  refund_status TEXT NOT NULL DEFAULT '' CHECK (refund_status IN ('','refunded','credited')),
+  refund_ref TEXT DEFAULT '',
+  refund_note TEXT DEFAULT '',
+  refund_resolved_at TEXT,
   chk_artwork INTEGER NOT NULL DEFAULT 0,
   chk_product INTEGER NOT NULL DEFAULT 0,
   chk_payment INTEGER NOT NULL DEFAULT 0,
@@ -92,11 +98,43 @@ CREATE TABLE IF NOT EXISTS order_items (
 CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   order_id INTEGER NOT NULL REFERENCES orders(id),
-  kind TEXT NOT NULL CHECK (kind IN ('artwork','receipt')),
+  kind TEXT NOT NULL CHECK (kind IN ('artwork','receipt','delivery')),
   stored_name TEXT NOT NULL,
   original_name TEXT NOT NULL,
   size INTEGER NOT NULL DEFAULT 0,
   uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL REFERENCES orders(id),
+  amount REAL NOT NULL,
+  bank_ref TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','verified','rejected')),
+  source TEXT NOT NULL DEFAULT 'customer' CHECK (source IN ('customer','admin')),
+  file_id INTEGER REFERENCES files(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS credits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id INTEGER NOT NULL REFERENCES users(id),
+  amount REAL NOT NULL,
+  order_id INTEGER REFERENCES orders(id),
+  note TEXT DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS status_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL REFERENCES orders(id),
+  actor_name TEXT NOT NULL,
+  actor_role TEXT NOT NULL,
+  event TEXT NOT NULL,
+  note TEXT DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS comments (
@@ -125,6 +163,7 @@ ensureColumn('products', 'artwork_spec', "artwork_spec TEXT DEFAULT ''");
 ensureColumn('orders', 'subtotal', 'subtotal REAL NOT NULL DEFAULT 0');
 ensureColumn('orders', 'sst_percent', 'sst_percent REAL NOT NULL DEFAULT 0');
 ensureColumn('orders', 'sst_amount', 'sst_amount REAL NOT NULL DEFAULT 0');
+ensureColumn('orders', 'credit_applied', 'credit_applied REAL NOT NULL DEFAULT 0');
 ensureColumn('orders', 'delivery_method', "delivery_method TEXT NOT NULL DEFAULT 'pickup'");
 ensureColumn('orders', 'delivery_address', "delivery_address TEXT DEFAULT ''");
 ensureColumn('orders', 'tracking_no', "tracking_no TEXT DEFAULT ''");
@@ -132,6 +171,11 @@ ensureColumn('orders', 'needed_by', "needed_by TEXT DEFAULT ''");
 ensureColumn('orders', 'eta_date', "eta_date TEXT DEFAULT ''");
 ensureColumn('orders', 'cancel_reason', "cancel_reason TEXT DEFAULT ''");
 ensureColumn('orders', 'cancelled_at', 'cancelled_at TEXT');
+ensureColumn('orders', 'revision_reason', "revision_reason TEXT DEFAULT ''");
+ensureColumn('orders', 'refund_status', "refund_status TEXT NOT NULL DEFAULT ''");
+ensureColumn('orders', 'refund_ref', "refund_ref TEXT DEFAULT ''");
+ensureColumn('orders', 'refund_note', "refund_note TEXT DEFAULT ''");
+ensureColumn('orders', 'refund_resolved_at', 'refund_resolved_at TEXT');
 
 // ---- seed ----
 const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
@@ -182,6 +226,7 @@ if (!db.prepare("SELECT value FROM settings WHERE key = 'invoice_seq'").get()) {
 if (setting('sst_percent', null) === null) setSetting('sst_percent', '0');
 if (setting('lead_days', null) === null) setSetting('lead_days', '3');
 if (setting('whatsapp', null) === null) setSetting('whatsapp', '');
+if (setting('deposit_percent', null) === null) setSetting('deposit_percent', '50');
 
 function nextInvoiceNo() {
   const next = parseInt(setting('invoice_seq', '10000'), 10) + 1;
@@ -212,4 +257,25 @@ function priceFor(customerId, productId, qty) {
   return price;
 }
 
-module.exports = { db, nextInvoiceNo, priceFor, tiersFor, setting, setSetting };
+// Verified money on an order: verified bank payments + store credit applied at submission.
+function paidFor(order) {
+  const row = db
+    .prepare("SELECT COALESCE(SUM(amount),0) AS s FROM payments WHERE order_id = ? AND status = 'verified'")
+    .get(order.id);
+  return Math.round((row.s + (order.credit_applied || 0)) * 100) / 100;
+}
+
+function creditBalance(customerId) {
+  const row = db.prepare('SELECT COALESCE(SUM(amount),0) AS s FROM credits WHERE customer_id = ?').get(customerId);
+  return Math.round(row.s * 100) / 100;
+}
+
+function logEvent(orderId, actor, event, note) {
+  db.prepare('INSERT INTO status_log (order_id, actor_name, actor_role, event, note) VALUES (?,?,?,?,?)')
+    .run(orderId, actor.name, actor.role, event, note || '');
+}
+
+module.exports = {
+  db, nextInvoiceNo, priceFor, tiersFor, setting, setSetting,
+  paidFor, creditBalance, logEvent,
+};
