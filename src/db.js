@@ -29,7 +29,16 @@ CREATE TABLE IF NOT EXISTS products (
   description TEXT DEFAULT '',
   unit TEXT NOT NULL DEFAULT 'pcs',
   base_price REAL NOT NULL DEFAULT 0,
+  moq INTEGER NOT NULL DEFAULT 1,
+  artwork_spec TEXT DEFAULT '',
   active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS price_tiers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER NOT NULL REFERENCES products(id),
+  min_qty INTEGER NOT NULL,
+  price REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS customer_prices (
@@ -45,18 +54,28 @@ CREATE TABLE IF NOT EXISTS orders (
   invoice_no TEXT NOT NULL UNIQUE,
   customer_id INTEGER NOT NULL REFERENCES users(id),
   status TEXT NOT NULL DEFAULT 'submitted'
-    CHECK (status IN ('submitted','confirmed','completed','delivered')),
+    CHECK (status IN ('submitted','confirmed','completed','delivered','cancelled')),
+  subtotal REAL NOT NULL DEFAULT 0,
+  sst_percent REAL NOT NULL DEFAULT 0,
+  sst_amount REAL NOT NULL DEFAULT 0,
   total REAL NOT NULL DEFAULT 0,
   notes TEXT DEFAULT '',
   wetransfer_link TEXT DEFAULT '',
   payment_ref TEXT DEFAULT '',
+  delivery_method TEXT NOT NULL DEFAULT 'pickup' CHECK (delivery_method IN ('pickup','courier')),
+  delivery_address TEXT DEFAULT '',
+  tracking_no TEXT DEFAULT '',
+  needed_by TEXT DEFAULT '',
+  eta_date TEXT DEFAULT '',
+  cancel_reason TEXT DEFAULT '',
   chk_artwork INTEGER NOT NULL DEFAULT 0,
   chk_product INTEGER NOT NULL DEFAULT 0,
   chk_payment INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   confirmed_at TEXT,
   completed_at TEXT,
-  delivered_at TEXT
+  delivered_at TEXT,
+  cancelled_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS order_items (
@@ -80,11 +99,39 @@ CREATE TABLE IF NOT EXISTS files (
   uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL REFERENCES orders(id),
+  author_id INTEGER NOT NULL REFERENCES users(id),
+  author_name TEXT NOT NULL,
+  author_role TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 `);
+
+// ---- lightweight migrations for databases created before these columns existed ----
+function ensureColumn(table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+}
+ensureColumn('products', 'moq', 'moq INTEGER NOT NULL DEFAULT 1');
+ensureColumn('products', 'artwork_spec', "artwork_spec TEXT DEFAULT ''");
+ensureColumn('orders', 'subtotal', 'subtotal REAL NOT NULL DEFAULT 0');
+ensureColumn('orders', 'sst_percent', 'sst_percent REAL NOT NULL DEFAULT 0');
+ensureColumn('orders', 'sst_amount', 'sst_amount REAL NOT NULL DEFAULT 0');
+ensureColumn('orders', 'delivery_method', "delivery_method TEXT NOT NULL DEFAULT 'pickup'");
+ensureColumn('orders', 'delivery_address', "delivery_address TEXT DEFAULT ''");
+ensureColumn('orders', 'tracking_no', "tracking_no TEXT DEFAULT ''");
+ensureColumn('orders', 'needed_by', "needed_by TEXT DEFAULT ''");
+ensureColumn('orders', 'eta_date', "eta_date TEXT DEFAULT ''");
+ensureColumn('orders', 'cancel_reason', "cancel_reason TEXT DEFAULT ''");
+ensureColumn('orders', 'cancelled_at', 'cancelled_at TEXT');
 
 // ---- seed ----
 const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
@@ -98,32 +145,71 @@ if (userCount === 0) {
 
 const productCount = db.prepare('SELECT COUNT(*) AS n FROM products').get().n;
 if (productCount === 0) {
-  const ins = db.prepare('INSERT INTO products (name, description, unit, base_price) VALUES (?,?,?,?)');
-  ins.run('Cotton T-Shirt (Custom Print)', 'Full-colour custom printed cotton t-shirt', 'pcs', 25.0);
-  ins.run('Microfiber Towel (Custom)', 'Custom dyed/printed microfiber towel', 'pcs', 12.5);
-  ins.run('Tote Bag (Silkscreen)', 'Canvas tote bag with silkscreen print', 'pcs', 8.0);
-  ins.run('Lanyard (Full Sublimation)', '20mm full sublimation lanyard with hook', 'pcs', 3.5);
-  ins.run('Banner (Per Metre)', 'Heavy-duty printed fabric banner', 'metre', 45.0);
+  const ins = db.prepare(
+    'INSERT INTO products (name, description, unit, base_price, moq, artwork_spec) VALUES (?,?,?,?,?,?)'
+  );
+  const tier = db.prepare('INSERT INTO price_tiers (product_id, min_qty, price) VALUES (?,?,?)');
+  let r;
+  r = ins.run('Cotton T-Shirt (Custom Print)', 'Full-colour custom printed cotton t-shirt', 'pcs', 25.0, 10,
+    'AI/PDF vector or 300dpi PNG, include size breakdown in notes');
+  tier.run(r.lastInsertRowid, 50, 22.5);
+  tier.run(r.lastInsertRowid, 100, 19.9);
+  r = ins.run('Microfiber Towel (Custom)', 'Custom dyed/printed microfiber towel', 'pcs', 12.5, 20,
+    '300dpi PNG or AI file, full-bleed with 3mm margin');
+  tier.run(r.lastInsertRowid, 100, 11.0);
+  r = ins.run('Tote Bag (Silkscreen)', 'Canvas tote bag with silkscreen print', 'pcs', 8.0, 50,
+    'Vector AI/PDF only (silkscreen), max 3 colours');
+  tier.run(r.lastInsertRowid, 200, 7.0);
+  r = ins.run('Lanyard (Full Sublimation)', '20mm full sublimation lanyard with hook', 'pcs', 3.5, 100,
+    'AI template available on request, text converted to outlines');
+  tier.run(r.lastInsertRowid, 500, 3.0);
+  tier.run(r.lastInsertRowid, 1000, 2.6);
+  r = ins.run('Banner (Per Metre)', 'Heavy-duty printed fabric banner', 'metre', 45.0, 1,
+    '300dpi JPG/PDF at actual size');
 }
 
-if (!db.prepare("SELECT value FROM settings WHERE key = 'invoice_seq'").get()) {
-  db.prepare("INSERT INTO settings (key, value) VALUES ('invoice_seq', '10000')").run();
+function setting(key, fallback) {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  return row ? row.value : fallback;
 }
+function setSetting(key, value) {
+  db.prepare('INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+    .run(key, String(value));
+}
+if (!db.prepare("SELECT value FROM settings WHERE key = 'invoice_seq'").get()) {
+  setSetting('invoice_seq', '10000');
+}
+if (setting('sst_percent', null) === null) setSetting('sst_percent', '0');
+if (setting('lead_days', null) === null) setSetting('lead_days', '3');
+if (setting('whatsapp', null) === null) setSetting('whatsapp', '');
 
 function nextInvoiceNo() {
-  const row = db.prepare("SELECT value FROM settings WHERE key = 'invoice_seq'").get();
-  const next = parseInt(row.value, 10) + 1;
-  db.prepare("UPDATE settings SET value = ? WHERE key = 'invoice_seq'").run(String(next));
+  const next = parseInt(setting('invoice_seq', '10000'), 10) + 1;
+  setSetting('invoice_seq', next);
   return next;
 }
 
-// Price for a customer: customer-specific override, otherwise product base price.
-function priceFor(customerId, productId) {
-  const row = db
-    .prepare('SELECT price FROM customer_prices WHERE customer_id = ? AND product_id = ?')
-    .get(customerId, productId);
-  if (row) return row.price;
-  return db.prepare('SELECT base_price FROM products WHERE id = ?').get(productId).base_price;
+function tiersFor(productId) {
+  return db
+    .prepare('SELECT min_qty, price FROM price_tiers WHERE product_id = ? ORDER BY min_qty')
+    .all(productId);
 }
 
-module.exports = { db, nextInvoiceNo, priceFor };
+// Unit price for a customer at a given quantity:
+// 1. a customer-specific price set by admin always wins (flat, any qty);
+// 2. otherwise the best quantity tier the qty reaches;
+// 3. otherwise the product base price.
+function priceFor(customerId, productId, qty) {
+  const override = db
+    .prepare('SELECT price FROM customer_prices WHERE customer_id = ? AND product_id = ?')
+    .get(customerId, productId);
+  if (override) return override.price;
+  const q = Math.max(1, qty || 1);
+  let price = db.prepare('SELECT base_price FROM products WHERE id = ?').get(productId).base_price;
+  for (const t of tiersFor(productId)) {
+    if (q >= t.min_qty) price = t.price;
+  }
+  return price;
+}
+
+module.exports = { db, nextInvoiceNo, priceFor, tiersFor, setting, setSetting };
