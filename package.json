@@ -1,0 +1,16 @@
+{
+  "name": "aramega-order-portal",
+  "version": "1.0.0",
+  "description": "Customer order portal with auto-generated invoices, payment proof uploads and admin verification backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^13.0.3",
+    "express": "^5.3.0",
+    "express-session": "^1.19.0",
+    "multer": "^2.5.0"
+  }
+}
