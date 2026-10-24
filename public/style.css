@@ -399,3 +399,12 @@ label > .req-chip { align-self: flex-start; }
 .express-opt { background: var(--warn-bg); border-radius: 8px; padding: 0.4rem 0.75rem; }
 .proof-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: flex-start; }
 .stat-link { text-decoration: none; color: inherit; display: flex; flex-direction: column; gap: 0.1rem; }
+
+/* ---------- v6: whitish-lime login, logo, pricelist ---------- */
+.login-body { background: linear-gradient(145deg, #ffffff, var(--lime-100) 55%, var(--lime-200)); }
+.login-card { border: 1px solid var(--lime-200); box-shadow: 0 20px 60px rgba(101, 163, 13, 0.18); }
+.login-logo-img { max-height: 64px; max-width: 220px; object-fit: contain; }
+.brand-logo { display: inline-flex; align-items: center; justify-content: center; background: #fff;
+  border-radius: 8px; padding: 2px 6px; height: 34px; font-weight: 800; color: var(--lime-900); }
+.brand-logo img { max-height: 28px; max-width: 110px; object-fit: contain; display: block; }
+.pricelist-wrap { max-height: 420px; overflow-y: auto; }

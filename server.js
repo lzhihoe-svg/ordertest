@@ -7,8 +7,8 @@ const multer = require('multer');
 const bcrypt = require('bcryptjs');
 
 const {
-  db, nextInvoiceNo, nextQuoteNo, priceFor, tiersFor, setting, setSetting,
-  paidFor, creditBalance, logEvent,
+  db, nextInvoiceNo, nextQuoteNo, randomOrderNo, priceFor, tiersFor, setting, setSetting,
+  paidFor, creditBalance, logEvent, touchOrder,
 } = require('./src/db');
 const V = require('./src/views');
 
@@ -98,6 +98,40 @@ function getLog(orderId) {
 function round2(n) {
   return Math.round(n * 100) / 100;
 }
+
+// Validate a promo code; returns {promo} or {error}.
+function checkPromo(code) {
+  if (!code) return { promo: null };
+  const p = db.prepare('SELECT * FROM promo_codes WHERE code = ?').get(code);
+  if (!p || !p.active) return { error: 'That promo code is not valid.' };
+  if (p.expires && p.expires < klDatePlus(0)) return { error: 'That promo code has expired.' };
+  if (p.max_uses > 0 && p.used_count >= p.max_uses) return { error: 'That promo code has been fully used.' };
+  return { promo: p };
+}
+
+// Rule: full payment must be VERIFIED within 3 hours of submission or the order
+// is cancelled automatically. Orders with a payment still awaiting verification
+// are spared so a slow admin check never cancels a customer who already paid.
+function sweepUnpaidOrders() {
+  const SYSTEM = { name: 'System', role: 'admin' };
+  const candidates = db
+    .prepare(`SELECT * FROM orders WHERE status = 'submitted'
+              AND datetime(created_at) <= datetime('now', '-3 hours')`)
+    .all();
+  for (const o of candidates) {
+    const pending = db
+      .prepare("SELECT COUNT(*) AS n FROM payments WHERE order_id = ? AND status = 'pending'")
+      .get(o.id).n;
+    if (pending > 0) continue;
+    if (paidFor(o) + 0.005 >= o.total) continue;
+    db.prepare(`UPDATE orders SET status = 'cancelled', cancelled_at = datetime('now'),
+                cancel_reason = 'Full payment was not verified within 3 hours of submission (automatic cancellation)'
+                WHERE id = ?`).run(o.id);
+    logEvent(o.id, SYSTEM, 'cancelled', 'Automatic: full payment not verified within 3 hours');
+  }
+}
+setInterval(sweepUnpaidOrders, 10 * 60 * 1000);
+sweepUnpaidOrders();
 
 // Today in Kuala Lumpur as YYYY-MM-DD, plus N days.
 function klDatePlus(days) {
@@ -220,29 +254,6 @@ function paymentsList(order, { isAdmin }) {
     .join('')}</ul>`;
 }
 
-function commentsSection(order, postUrl) {
-  const comments = getComments(order.id);
-  return `
-  <div class="card">
-    <h2>Order Discussion</h2>
-    ${comments.length ? `<ul class="comment-list">${comments
-      .map(
-        (c) => `<li class="comment ${c.author_role === 'admin' ? 'comment-admin' : ''}">
-        <div class="comment-head"><strong>${V.esc(c.author_name)}</strong>
-          <span class="badge ${c.author_role === 'admin' ? 'badge-completed' : 'badge-confirmed'}">${c.author_role === 'admin' ? 'Aramega' : 'Customer'}</span>
-          <span class="muted small">${V.esc(V.fmtDate(c.created_at))}</span></div>
-        <p>${V.esc(c.body)}</p></li>`
-      )
-      .join('')}</ul>` : '<p class="muted">No messages yet. Use this to discuss artwork, sizes or delivery for this order.</p>'}
-    <form method="post" action="${postUrl}" class="stack">
-      <label>Message
-        <textarea name="body" rows="2" required maxlength="2000" placeholder="Write a message about this order..."></textarea>
-      </label>
-      <button class="btn btn-outline" type="submit">Send Message</button>
-    </form>
-  </div>`;
-}
-
 function historySection(order) {
   const log = getLog(order.id);
   if (!log.length) return '';
@@ -338,6 +349,20 @@ app.get('/account', requireCustomer, (req, res) => {
         <button class="btn btn-primary" type="submit">Update Password</button>
       </form>
     </div>
+    <div class="card">
+      <h2>My Price List</h2>
+      <p class="muted small">Your prices for each product. Bulk discounts (where set) apply automatically by quantity.</p>
+      <div class="table-wrap pricelist-wrap"><table class="table">
+        <thead><tr><th>Product</th><th class="num">Your Price</th></tr></thead>
+        <tbody>${db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY id').all().map((p) => {
+          const price = priceFor(req.user.id, p.id, 1);
+          const tiers = tiersFor(p.id);
+          return `<tr><td data-label="Product">${V.esc(p.name)}</td>
+          <td data-label="Your Price" class="num">${price > 0 ? V.rm(price) + ' / ' + V.esc(p.unit) : '<span class="muted">Not set</span>'}
+          ${tiers.length ? `<div class="muted small">${tiers.map((t) => `${t.min_qty}+: ${V.rm(t.price)}`).join(' &middot; ')}</div>` : ''}</td></tr>`;
+        }).join('')}</tbody>
+      </table></div>
+    </div>
   </div>`;
   render(req, res, { title: 'My Account', user: req.user, body, active: 'account' });
 });
@@ -367,6 +392,7 @@ app.post('/account/address', requireCustomer, (req, res) => {
 // ---------- customer: dashboard ----------
 
 app.get('/', requireCustomer, (req, res) => {
+  sweepUnpaidOrders();
   const orders = db
     .prepare('SELECT * FROM orders WHERE customer_id = ? ORDER BY id DESC')
     .all(req.user.id);
@@ -417,16 +443,9 @@ app.get('/orders/new', requireCustomer, (req, res) => {
       const tiers = tiersFor(p.id);
       pricing[p.id] = { base: p.base_price, moq: p.moq, override: override ? override.price : null, tiers };
       const startPrice = priceFor(req.user.id, p.id, p.moq);
-      const tierInfo = override
-        ? '<span class="tier-chip">Your special price</span>'
-        : tiers.map((t) => `<span class="tier-chip">${t.min_qty}+ : ${V.rm(t.price)}</span>`).join(' ');
       return `<tr>
-        <td data-label="Product"><strong>${V.esc(p.name)}</strong>
-          <div class="muted small">${V.esc(p.description)}</div>
-          ${tierInfo ? `<div class="tier-row">${tierInfo}</div>` : ''}
-        </td>
+        <td data-label="Product"><strong>${V.esc(p.name)}</strong></td>
         <td data-label="Your Price" class="num price-cell" id="price_${p.id}">${V.rm(startPrice)} / ${V.esc(p.unit)}</td>
-        <td data-label="Min Order" class="num">${p.moq} ${V.esc(p.unit)}</td>
         <td data-label="Quantity" class="qty-cell">
           <input class="qty-input" type="number" name="qty_${p.id}" data-pid="${p.id}" min="0" step="1"
             value="${prefill[p.id] || 0}" inputmode="numeric">
@@ -443,24 +462,26 @@ app.get('/orders/new', requireCustomer, (req, res) => {
   Full payment is required before production starts.</p></div></div>
   <form method="post" action="/orders" enctype="multipart/form-data" id="order-form" class="stack">
     <div class="card">
-      <h2>1. Products &amp; Quantity</h2>
-      <p class="muted small">Each product has a minimum order quantity. Bulk prices apply automatically when your quantity reaches a tier.</p>
+      <h2>1. Job Name &amp; Products</h2>
+      <label style="max-width:420px; margin-bottom:0.9rem">Job name <span class="req-chip">Required</span>
+        <input name="job_name" id="job-name" required maxlength="100" placeholder="e.g. Company Family Day Tees 2026">
+      </label>
       <div class="table-wrap"><table class="table order-table">
-        <thead><tr><th>Product</th><th class="num">Your Price</th><th class="num">Min Order</th><th>Quantity</th><th class="num">Subtotal</th></tr></thead>
+        <thead><tr><th>Product</th><th class="num">Your Price</th><th>Quantity</th><th class="num">Subtotal</th></tr></thead>
         <tbody>${rows}</tbody>
         <tfoot>
-          <tr><td colspan="4" class="num total-label">Subtotal</td><td class="num" id="f-subtotal">RM 0.00</td></tr>
-          <tr id="express-row" style="display:none"><td colspan="4" class="num total-label">Rush Order Surcharge (${expressPct}%)</td><td class="num" id="f-express">RM 0.00</td></tr>
-          ${sst > 0 ? `<tr><td colspan="4" class="num total-label">SST (${sst}%)</td><td class="num" id="f-sst">RM 0.00</td></tr>` : ''}
-          <tr><td colspan="4" class="num total-label"><strong>Order Total</strong></td>
+          <tr><td colspan="3" class="num total-label">Subtotal</td><td class="num" id="f-subtotal">RM 0.00</td></tr>
+          <tr id="express-row" style="display:none"><td colspan="3" class="num total-label">Rush Order Surcharge (${expressPct}%)</td><td class="num" id="f-express">RM 0.00</td></tr>
+          <tr id="disc-row" style="display:none"><td colspan="3" class="num total-label">Promo Discount</td><td class="num" id="f-disc">RM 0.00</td></tr>
+          ${sst > 0 ? `<tr><td colspan="3" class="num total-label">SST (${sst}%)</td><td class="num" id="f-sst">RM 0.00</td></tr>` : ''}
+          <tr><td colspan="3" class="num total-label"><strong>Order Total</strong></td>
           <td class="num"><strong id="order-total">RM 0.00</strong></td></tr>
         </tfoot>
       </table></div>
     </div>
     <div class="card">
       <h2>2. Artwork Files <span class="req-chip">Required</span></h2>
-      <p class="muted">Upload your artwork as a <strong>.zip file (up to 500MB)</strong>, or paste a WeTransfer link.
-      <strong>Your order cannot be submitted without artwork.</strong></p>
+      <p class="muted">Provide your artwork as <strong>either</strong> a .zip file (up to 500MB) <strong>or</strong> a WeTransfer link — one of the two, not both. Your order cannot be submitted without artwork.</p>
       <label>Artwork zip file
         <input type="file" name="artwork" id="artwork-file" accept=".zip">
       </label>
@@ -494,7 +515,14 @@ app.get('/orders/new', requireCustomer, (req, res) => {
       <p class="muted small">Credit is applied up to the order total; any remainder stays in your account.</p>
     </div>` : ''}
     <div class="card">
-      <h2>${credit > 0 ? '5' : '4'}. Notes (optional)</h2>
+      <h2>${credit > 0 ? '5' : '4'}. Promo Code (optional)</h2>
+      <label style="max-width:300px">Promo code
+        <input name="promo_code" maxlength="30" placeholder="e.g. SAVE10" style="text-transform:uppercase">
+      </label>
+      <p class="muted small">If we gave you a promo code, enter it here — the discount is applied on your invoice.</p>
+    </div>
+    <div class="card">
+      <h2>${credit > 0 ? '6' : '5'}. Notes (optional)</h2>
       <label>Order notes
         <textarea name="notes" rows="3" placeholder="Sizes breakdown, colours, delivery instructions..."></textarea>
       </label>
@@ -549,21 +577,24 @@ app.get('/orders/new', requireCustomer, (req, res) => {
       const problems = [];
       let any = false;
       form.querySelectorAll('.qty-input').forEach(inp => {
-        const qty = parseInt(inp.value || '0', 10);
-        if (qty > 0) {
-          any = true;
-          const moq = PRICING[inp.dataset.pid].moq;
-          if (qty < moq) problems.push('Minimum order quantity not met (minimum ' + moq + ') for one of your products.');
-        }
+        if (parseInt(inp.value || '0', 10) > 0) any = true;
       });
       if (!any) problems.push('Please enter a quantity for at least one product.');
+      if (!document.getElementById('job-name').value.trim()) problems.push('Please give this order a job name.');
       const hasFile = document.getElementById('artwork-file').files.length > 0;
       const hasLink = document.getElementById('wetransfer-link').value.trim().length > 0;
       if (!hasFile && !hasLink) problems.push('Artwork is required: upload a .zip file or paste a WeTransfer link.');
+      if (hasFile && hasLink) problems.push('Provide EITHER the zip file OR the WeTransfer link, not both.');
       const courier = form.querySelector('input[name="delivery_method"]:checked').value === 'courier';
       if (courier && !document.getElementById('delivery-address').value.trim()) problems.push('Delivery address is required for courier delivery.');
       if (!document.getElementById('needed-by').value) problems.push('Please choose a needed-by date.');
       if (problems.length) { e.preventDefault(); alert(problems.join('\\n')); }
+    });
+    document.getElementById('artwork-file').addEventListener('change', function(){
+      if (this.files.length) document.getElementById('wetransfer-link').value = '';
+    });
+    document.getElementById('wetransfer-link').addEventListener('input', function(){
+      if (this.value.trim()) document.getElementById('artwork-file').value = '';
     });
     form.querySelectorAll('input[name="delivery_method"]').forEach(r => r.addEventListener('change', () => {
       document.getElementById('address-label').style.display =
@@ -580,27 +611,40 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
     return res.redirect('/orders/new');
   };
 
+  const jobName = String(req.body.job_name || '').trim().slice(0, 100);
+  if (!jobName) return fail('Please give this order a job name.');
+
   const products = db.prepare('SELECT * FROM products WHERE active = 1').all();
   const items = [];
   for (const p of products) {
     const qty = parseInt(req.body[`qty_${p.id}`] || '0', 10);
     if (qty > 0) {
-      // Rule: quantity must meet the product's minimum order quantity.
-      if (qty < p.moq) return fail(`Minimum order for ${p.name} is ${p.moq} ${p.unit}. You entered ${qty}.`);
+      if (qty < p.moq) return fail(`Minimum order for ${p.name} is ${p.moq} ${p.unit}.`);
       const unitPrice = priceFor(req.user.id, p.id, qty);
+      // Rule: products without a price set cannot be ordered.
+      if (unitPrice <= 0) return fail(`The price for ${p.name} has not been set yet. Please contact us.`);
       items.push({ product: p, qty, unitPrice, lineTotal: round2(unitPrice * qty) });
     }
   }
   if (!items.length) return fail('Please select at least one product with a quantity.');
 
-  // Rule: artwork is mandatory — a zip upload OR a WeTransfer link.
+  // Rule: artwork is mandatory — EITHER a zip upload OR a WeTransfer link, never both.
   const wetransfer = String(req.body.wetransfer_link || '').trim().slice(0, 500);
   if (!req.file && !wetransfer) {
     return fail('Artwork is required: upload a .zip file (max 500MB) or paste a WeTransfer link before submitting.');
   }
+  if (req.file && wetransfer) {
+    return fail('Provide EITHER the artwork zip file OR the WeTransfer link — not both.');
+  }
   if (wetransfer && !/^https?:\/\//i.test(wetransfer)) {
     return fail('The WeTransfer link must start with http:// or https://.');
   }
+
+  // Promo code (optional).
+  const promoCode = String(req.body.promo_code || '').trim().toUpperCase().slice(0, 30);
+  const promoCheck = checkPromo(promoCode);
+  if (promoCheck.error) return fail(promoCheck.error);
+  const promo = promoCheck.promo;
 
   // Rule: courier delivery needs an address.
   const method = req.body.delivery_method === 'courier' ? 'courier' : 'pickup';
@@ -624,9 +668,13 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
 
   const subtotal = round2(items.reduce((s, i) => s + i.lineTotal, 0));
   const expressAmount = isExpress ? round2((subtotal * expressPct) / 100) : 0;
+  const chargeBase = round2(subtotal + expressAmount);
+  const discountAmount = promo
+    ? round2(promo.kind === 'percent' ? (chargeBase * promo.value) / 100 : Math.min(promo.value, chargeBase))
+    : 0;
   const sstPercent = parseFloat(setting('sst_percent', '0')) || 0;
-  const sstAmount = round2(((subtotal + expressAmount) * sstPercent) / 100);
-  const total = round2(subtotal + expressAmount + sstAmount);
+  const sstAmount = round2(((chargeBase - discountAmount) * sstPercent) / 100);
+  const total = round2(chargeBase - discountAmount + sstAmount);
 
   // Store credit: apply up to the order total if the customer opted in.
   let creditApplied = 0;
@@ -639,16 +687,18 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
     const invNum = nextInvoiceNo();
     const info = db
       .prepare(
-        `INSERT INTO orders (order_no, invoice_no, customer_id, subtotal, is_express, express_percent,
-          express_amount, sst_percent, sst_amount, total,
+        `INSERT INTO orders (order_no, invoice_no, customer_id, job_name, subtotal, is_express, express_percent,
+          express_amount, promo_code, discount_amount, sst_percent, sst_amount, total,
           credit_applied, notes, wetransfer_link, delivery_method, delivery_address, needed_by)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
-        `ORD-${invNum}`, `INV-${invNum}`, req.user.id, subtotal, isExpress ? 1 : 0,
-        isExpress ? expressPct : 0, expressAmount, sstPercent, sstAmount, total,
+        randomOrderNo(), `INV-${invNum}`, req.user.id, jobName, subtotal, isExpress ? 1 : 0,
+        isExpress ? expressPct : 0, expressAmount, promo ? promo.code : '', discountAmount,
+        sstPercent, sstAmount, total,
         creditApplied, String(req.body.notes || '').slice(0, 2000), wetransfer, method, address, neededBy
       );
+    if (promo) db.prepare('UPDATE promo_codes SET used_count = used_count + 1 WHERE id = ?').run(promo.id);
     const id = info.lastInsertRowid;
     const insItem = db.prepare(
       `INSERT INTO order_items (order_id, product_id, product_name, unit, qty, unit_price, line_total)
@@ -669,7 +719,7 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
     return id;
   })();
 
-  flash(req, 'success', 'Order submitted! Your invoice has been generated. Please make payment and upload your bank receipt.');
+  flash(req, 'success', 'Order submitted! Your invoice has been generated. Please make FULL payment and upload your bank receipt — unverified orders are cancelled automatically after 3 hours.');
   res.redirect(`/orders/${orderId}`);
 });
 
@@ -691,6 +741,7 @@ function itemsCard(order, notesLabel) {
     <tfoot>
       <tr><td colspan="3" class="num total-label">Subtotal</td><td class="num">${V.rm(order.subtotal)}</td></tr>
       ${order.is_express ? `<tr><td colspan="3" class="num total-label">Rush Order Surcharge (${order.express_percent}%)</td><td class="num">${V.rm(order.express_amount)}</td></tr>` : ''}
+      ${order.discount_amount > 0 ? `<tr><td colspan="3" class="num total-label">Promo Discount (${V.esc(order.promo_code)})</td><td class="num">- ${V.rm(order.discount_amount)}</td></tr>` : ''}
       ${order.sst_percent > 0 ? `<tr><td colspan="3" class="num total-label">SST (${order.sst_percent}%)</td><td class="num">${V.rm(order.sst_amount)}</td></tr>` : ''}
       <tr><td colspan="3" class="num total-label"><strong>Total</strong></td><td class="num"><strong>${V.rm(order.total)}</strong></td></tr>
     </tfoot>
@@ -798,7 +849,7 @@ app.get('/orders/:id', requireCustomer, (req, res) => {
   if (!order || order.customer_id !== req.user.id) return res.status(404).send('Order not found');
   const body = `
   <div class="page-head">
-    <div><h1>Order ${V.esc(order.order_no)}</h1><p class="muted">Placed ${V.esc(V.fmtDate(order.created_at))}</p></div>
+    <div><h1>Order ${V.esc(order.order_no)}</h1><p class="muted">${order.job_name ? `<strong>${V.esc(order.job_name)}</strong> &middot; ` : ''}Submitted ${V.esc(V.fmtDate(order.created_at))} &middot; Last update ${V.esc(V.fmtDate(order.updated_at || order.created_at))}</p></div>
     <div class="head-actions">
       ${V.statusBadge(order.status)}
       ${order.status !== 'cancelled' ? `<a class="btn btn-primary" href="/orders/${order.id}/invoice" target="_blank">View Invoice</a>` : ''}
@@ -815,7 +866,10 @@ app.get('/orders/:id', requireCustomer, (req, res) => {
     </form>
   </div>` : ''}
   ${refundBanner(order, { isAdmin: false })}
+  ${order.status === 'submitted' && round2(order.total - paidFor(order)) > 0 ? `
+  <div class="flash err"><strong>Payment deadline:</strong> full payment must be made and verified within 3 hours of submission, or this order is cancelled automatically.</div>` : ''}
   <div class="card"><h2>Order Status</h2>${V.timeline(order)}</div>
+  ${historySection(order)}
   <div class="grid-2">
     ${itemsCard(order, 'Notes')}
     ${deliveryCard(order, getFiles(order.id, 'delivery'))}
@@ -824,8 +878,6 @@ app.get('/orders/:id', requireCustomer, (req, res) => {
     ${artworkCard(order, { isAdmin: false })}
     ${paymentsCard(order, { isAdmin: false })}
   </div>` : ''}
-  ${commentsSection(order, `/orders/${order.id}/comment`)}
-  ${historySection(order)}
   ${order.status === 'submitted' ? `
   <div class="card cancel-card">
     <h2>Cancel Order</h2>
@@ -855,6 +907,7 @@ app.post('/orders/:id/artwork', requireCustomer, runUpload(uploadArtwork), (req,
   db.prepare('INSERT INTO files (order_id, kind, stored_name, original_name, size) VALUES (?,?,?,?,?)').run(
     order.id, 'artwork', req.file.filename, req.file.originalname, req.file.size
   );
+  touchOrder(order.id);
   flash(req, 'success', 'Artwork uploaded.');
   res.redirect(`/orders/${order.id}`);
 });
@@ -872,6 +925,7 @@ app.post('/orders/:id/wetransfer', requireCustomer, (req, res) => {
     return res.redirect(`/orders/${order.id}`);
   }
   db.prepare('UPDATE orders SET wetransfer_link = ? WHERE id = ?').run(link, order.id);
+  touchOrder(order.id);
   flash(req, 'success', 'WeTransfer link saved.');
   res.redirect(`/orders/${order.id}`);
 });
@@ -941,17 +995,6 @@ app.post('/orders/:id/cancel', requireCustomer, (req, res) => {
     .run(reason, order.id);
   logEvent(order.id, req.user, 'cancelled', reason);
   flash(req, 'success', `Order ${order.order_no} has been cancelled.`);
-  res.redirect(`/orders/${order.id}`);
-});
-
-app.post('/orders/:id/comment', requireCustomer, (req, res) => {
-  const order = getOrder(req.params.id);
-  if (!order || order.customer_id !== req.user.id) return res.status(404).send('Order not found');
-  const body = String(req.body.body || '').trim().slice(0, 2000);
-  if (body) {
-    db.prepare('INSERT INTO comments (order_id, author_id, author_name, author_role, body) VALUES (?,?,?,?,?)')
-      .run(order.id, req.user.id, req.user.name, 'customer', body);
-  }
   res.redirect(`/orders/${order.id}`);
 });
 
@@ -1037,14 +1080,9 @@ app.get('/quotes', requireCustomer, (req, res) => {
         .get(req.user.id, p.id);
       const tiers = tiersFor(p.id);
       pricing[p.id] = { base: p.base_price, moq: p.moq, override: override ? override.price : null, tiers };
-      const tierInfo = override
-        ? '<span class="tier-chip">Your special price</span>'
-        : tiers.map((t) => `<span class="tier-chip">${t.min_qty}+ : ${V.rm(t.price)}</span>`).join(' ');
       return `<tr>
-        <td data-label="Product"><strong>${V.esc(p.name)}</strong>
-          ${tierInfo ? `<div class="tier-row">${tierInfo}</div>` : ''}</td>
+        <td data-label="Product"><strong>${V.esc(p.name)}</strong></td>
         <td data-label="Your Price" class="num" id="qprice_${p.id}">${V.rm(priceFor(req.user.id, p.id, p.moq))} / ${V.esc(p.unit)}</td>
-        <td data-label="Min Order" class="num">${p.moq} ${V.esc(p.unit)}</td>
         <td data-label="Quantity"><input class="qty-input" type="number" name="qty_${p.id}" data-pid="${p.id}" min="0" step="1" value="0" inputmode="numeric"></td>
         <td data-label="Subtotal" class="num" id="qsub_${p.id}">RM 0.00</td>
       </tr>`;
@@ -1059,12 +1097,12 @@ app.get('/quotes', requireCustomer, (req, res) => {
     <h2>Create Instant Quotation</h2>
     <form method="post" action="/quotes" id="quote-form">
       <div class="table-wrap"><table class="table">
-        <thead><tr><th>Product</th><th class="num">Your Price</th><th class="num">Min Order</th><th>Quantity</th><th class="num">Subtotal</th></tr></thead>
+        <thead><tr><th>Product</th><th class="num">Your Price</th><th>Quantity</th><th class="num">Subtotal</th></tr></thead>
         <tbody>${rows}</tbody>
         <tfoot>
-          <tr><td colspan="4" class="num total-label">Subtotal</td><td class="num" id="q-subtotal">RM 0.00</td></tr>
-          ${sst > 0 ? `<tr><td colspan="4" class="num total-label">SST (${sst}%)</td><td class="num" id="q-sst">RM 0.00</td></tr>` : ''}
-          <tr><td colspan="4" class="num total-label"><strong>Quotation Total</strong></td>
+          <tr><td colspan="3" class="num total-label">Subtotal</td><td class="num" id="q-subtotal">RM 0.00</td></tr>
+          ${sst > 0 ? `<tr><td colspan="3" class="num total-label">SST (${sst}%)</td><td class="num" id="q-sst">RM 0.00</td></tr>` : ''}
+          <tr><td colspan="3" class="num total-label"><strong>Quotation Total</strong></td>
           <td class="num"><strong id="q-total">RM 0.00</strong></td></tr>
         </tfoot>
       </table></div>
@@ -1108,18 +1146,11 @@ app.get('/quotes', requireCustomer, (req, res) => {
     }
     qform.addEventListener('input', qRecalc);
     qform.addEventListener('submit', (e) => {
-      const problems = [];
       let any = false;
       qform.querySelectorAll('.qty-input').forEach(inp => {
-        const qty = parseInt(inp.value || '0', 10);
-        if (qty > 0) {
-          any = true;
-          const moq = QPRICING[inp.dataset.pid].moq;
-          if (qty < moq) problems.push('Minimum order quantity not met (minimum ' + moq + ') for one of your products.');
-        }
+        if (parseInt(inp.value || '0', 10) > 0) any = true;
       });
-      if (!any) problems.push('Please enter a quantity for at least one product.');
-      if (problems.length) { e.preventDefault(); alert(problems.join('\\n')); }
+      if (!any) { e.preventDefault(); alert('Please enter a quantity for at least one product.'); }
     });
   </script>`;
   render(req, res, { title: 'Quotations', user: req.user, body, active: 'quotes' });
@@ -1133,10 +1164,14 @@ app.post('/quotes', requireCustomer, (req, res) => {
     const qty = parseInt(req.body[`qty_${p.id}`] || '0', 10);
     if (qty > 0) {
       if (qty < p.moq) {
-        flash(req, 'error', `Minimum order for ${p.name} is ${p.moq} ${p.unit}. You entered ${qty}.`);
+        flash(req, 'error', `Minimum order for ${p.name} is ${p.moq} ${p.unit}.`);
         return res.redirect('/quotes');
       }
       const unitPrice = priceFor(req.user.id, p.id, qty);
+      if (unitPrice <= 0) {
+        flash(req, 'error', `The price for ${p.name} has not been set yet. Please contact us.`);
+        return res.redirect('/quotes');
+      }
       items.push({ product: p, qty, unitPrice, lineTotal: round2(unitPrice * qty) });
     }
   }
@@ -1199,6 +1234,9 @@ app.get('/quotes/:id', requireCustomer, (req, res) => {
     <h2>Convert to Order</h2>
     <p class="muted small">This places a real order at the quoted prices and generates the invoice. Artwork is required, same as a normal order.</p>
     <form method="post" action="/quotes/${q.id}/accept" enctype="multipart/form-data" class="stack">
+      <label>Job name <span class="req-chip">Required</span>
+        <input name="job_name" required maxlength="100" placeholder="e.g. Company Family Day Tees 2026">
+      </label>
       <label>Artwork zip file (max 500MB)
         <input type="file" name="artwork" accept=".zip">
       </label>
@@ -1317,9 +1355,12 @@ app.post('/quotes/:id/accept', requireCustomer, runUpload(uploadArtwork), (req, 
   if (q.valid_until && q.valid_until < klDatePlus(0)) {
     return bad('This quotation has expired. Generate a new one for current prices.');
   }
-  // Rule: artwork is mandatory, same as a normal order.
+  const jobName = String(req.body.job_name || '').trim().slice(0, 100);
+  if (!jobName) return bad('Please give this order a job name.');
+  // Rule: artwork is mandatory, same as a normal order — either file or link, never both.
   const wetransfer = String(req.body.wetransfer_link || '').trim().slice(0, 500);
   if (!req.file && !wetransfer) return bad('Artwork is required: upload a .zip file or paste a WeTransfer link.');
+  if (req.file && wetransfer) return bad('Provide EITHER the artwork zip file OR the WeTransfer link — not both.');
   if (wetransfer && !/^https?:\/\//i.test(wetransfer)) return bad('The WeTransfer link must start with http:// or https://.');
   const method = req.body.delivery_method === 'courier' ? 'courier' : 'pickup';
   const address = String(req.body.delivery_address || '').trim().slice(0, 500);
@@ -1335,12 +1376,12 @@ app.post('/quotes/:id/accept', requireCustomer, runUpload(uploadArtwork), (req, 
     const invNum = nextInvoiceNo();
     const info = db
       .prepare(
-        `INSERT INTO orders (order_no, invoice_no, customer_id, subtotal, sst_percent, sst_amount, total,
+        `INSERT INTO orders (order_no, invoice_no, customer_id, job_name, subtotal, sst_percent, sst_amount, total,
           notes, wetransfer_link, delivery_method, delivery_address, needed_by, quote_id)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
-        `ORD-${invNum}`, `INV-${invNum}`, req.user.id, q.subtotal, q.sst_percent, q.sst_amount, q.total,
+        randomOrderNo(), `INV-${invNum}`, req.user.id, jobName, q.subtotal, q.sst_percent, q.sst_amount, q.total,
         `From quotation ${q.quote_no}`, wetransfer, method, address, neededBy, q.id
       );
     const id = info.lastInsertRowid;
@@ -1464,6 +1505,7 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
       <table class="inv-meta">
         <tr><td>Invoice No</td><td><strong>${V.esc(order.invoice_no)}</strong></td></tr>
         <tr><td>Order No</td><td>${V.esc(order.order_no)}</td></tr>
+        ${order.job_name ? `<tr><td>Job</td><td>${V.esc(order.job_name)}</td></tr>` : ''}
         <tr><td>Date</td><td>${V.esc(V.fmtDate(order.created_at))}</td></tr>
         <tr><td>Needed by</td><td>${V.esc(fmtDay(order.needed_by))}</td></tr>
         <tr><td>Delivery</td><td>${order.delivery_method === 'courier' ? 'Courier' : 'Self Pickup'}</td></tr>
@@ -1491,6 +1533,7 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
     <tfoot>
       <tr><td colspan="4" class="num total-label">Subtotal</td><td class="num">${V.rm(order.subtotal)}</td></tr>
       ${order.is_express ? `<tr><td colspan="4" class="num total-label">Rush Order Surcharge (${order.express_percent}%)</td><td class="num">${V.rm(order.express_amount)}</td></tr>` : ''}
+      ${order.discount_amount > 0 ? `<tr><td colspan="4" class="num total-label">Promo Discount (${V.esc(order.promo_code)})</td><td class="num">- ${V.rm(order.discount_amount)}</td></tr>` : ''}
       ${order.sst_percent > 0 ? `<tr><td colspan="4" class="num total-label">SST (${order.sst_percent}%)</td><td class="num">${V.rm(order.sst_amount)}</td></tr>` : ''}
       <tr><td colspan="4" class="num total-label"><strong>TOTAL</strong></td><td class="num inv-total"><strong>${V.rm(order.total)}</strong></td></tr>
       ${order.credit_applied > 0 ? `<tr><td colspan="4" class="num total-label">Store Credit Applied</td><td class="num">- ${V.rm(order.credit_applied)}</td></tr>` : ''}
@@ -1503,7 +1546,7 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
     <p>Bank Name: CIMB<br>
     Beneficiary Name: Aramega Textile Sdn Bhd<br>
     Account Number: 8605494198</p>
-    <p class="muted small">Full payment is required before production starts. Please upload your bank receipt on the order page after making payment.</p>
+    <p class="muted small">Full payment is required before production starts, and must be verified within 3 hours of order submission or the order is cancelled automatically. Please upload your bank receipt on the order page after making payment.</p>
   </section>
 </div>
 </body>
@@ -1540,6 +1583,7 @@ app.get('/products/:id/template', (req, res) => {
 // ---------- admin: orders ----------
 
 app.get('/admin', requireAdmin, (req, res) => {
+  sweepUnpaidOrders();
   const filter = String(req.query.status || '');
   const q = String(req.query.q || '').trim();
   const allStatuses = ['submitted', 'needs_revision', 'confirmed', 'completed', 'delivered', 'cancelled'];
@@ -1620,13 +1664,13 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
     )
     .all();
   const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
-  const head = ['Order No', 'Invoice No', 'Customer', 'Company', 'Status', 'Created', 'Subtotal', 'SST %', 'SST', 'Total',
+  const head = ['Order No', 'Invoice No', 'Job Name', 'Customer', 'Company', 'Status', 'Created', 'Subtotal', 'SST %', 'SST', 'Total',
     'Credit Applied', 'Paid (verified)', 'Balance Due', 'Delivery', 'Needed By', 'ETA', 'Tracking No', 'Refund Resolution'];
   const lines = [head.map(esc).join(',')];
   for (const o of orders) {
     const paid = paidFor(o);
     lines.push([
-      o.order_no, o.invoice_no, o.customer_name, o.customer_company, V.STATUS[o.status].label, o.created_at,
+      o.order_no, o.invoice_no, o.job_name, o.customer_name, o.customer_company, V.STATUS[o.status].label, o.created_at,
       o.subtotal.toFixed(2), o.sst_percent, o.sst_amount.toFixed(2), o.total.toFixed(2),
       o.credit_applied.toFixed(2), paid.toFixed(2), Math.max(round2(o.total - paid), 0).toFixed(2),
       o.delivery_method, o.needed_by, o.eta_date, o.tracking_no, o.refund_status,
@@ -1726,7 +1770,7 @@ app.get('/admin/orders/:id', requireAdmin, (req, res) => {
   const body = `
   <div class="page-head">
     <div><h1>Order ${V.esc(order.order_no)}</h1>
-      <p class="muted">${V.esc(order.customer_company || order.customer_name)} (${V.esc(order.customer_name)}) &middot; ${V.esc(V.fmtDate(order.created_at))}</p></div>
+      <p class="muted">${order.job_name ? `<strong>${V.esc(order.job_name)}</strong> &middot; ` : ''}${V.esc(order.customer_company || order.customer_name)} &middot; Submitted ${V.esc(V.fmtDate(order.created_at))} &middot; Last update ${V.esc(V.fmtDate(order.updated_at || order.created_at))}</p></div>
     <div class="head-actions">
       ${V.statusBadge(order.status)}
       <a class="btn btn-outline" href="/admin/orders/${order.id}/invoice" target="_blank">View Invoice</a>
@@ -1734,6 +1778,7 @@ app.get('/admin/orders/:id', requireAdmin, (req, res) => {
   </div>
   ${refundBanner(order, { isAdmin: true })}
   <div class="card"><h2>Order Status</h2>${V.timeline(order)}</div>
+  ${historySection(order)}
   <div class="grid-2">
     ${itemsCard(order, 'Customer notes')}
     ${deliveryCard(order, getFiles(order.id, 'delivery'))}
@@ -1743,9 +1788,7 @@ app.get('/admin/orders/:id', requireAdmin, (req, res) => {
     ${paymentsCard(order, { isAdmin: true })}
   </div>
   ${verifySection}
-  ${deliveryProof}
-  ${commentsSection(order, `/admin/orders/${order.id}/comment`)}
-  ${historySection(order)}`;
+  ${deliveryProof}`;
   render(req, res, { title: `Admin - ${order.order_no}`, user: req.user, body, active: 'orders' });
 });
 
@@ -1765,6 +1808,7 @@ app.post('/admin/orders/:id/checks', requireAdmin, (req, res) => {
     req.body.chk_payment ? 1 : 0,
     order.id
   );
+  touchOrder(order.id);
   flash(req, 'success', 'Verification saved.');
   res.redirect(`/admin/orders/${order.id}`);
 });
@@ -1969,17 +2013,6 @@ app.post('/admin/orders/:id/cancel', requireAdmin, (req, res) => {
   logEvent(order.id, req.user, 'cancelled', reason);
   const paid = paidFor(order);
   flash(req, 'success', `Order ${order.order_no} cancelled.${paid > 0 ? ` The customer has ${V.rm(paid)} paid — resolve it as refund or store credit below.` : ''}`);
-  res.redirect(`/admin/orders/${order.id}`);
-});
-
-app.post('/admin/orders/:id/comment', requireAdmin, (req, res) => {
-  const order = getOrder(req.params.id);
-  if (!order) return res.status(404).send('Order not found');
-  const body = String(req.body.body || '').trim().slice(0, 2000);
-  if (body) {
-    db.prepare('INSERT INTO comments (order_id, author_id, author_name, author_role, body) VALUES (?,?,?,?,?)')
-      .run(order.id, req.user.id, req.user.name, 'admin', body);
-  }
   res.redirect(`/admin/orders/${order.id}`);
 });
 
@@ -2189,6 +2222,36 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
       </div>
       <button class="btn btn-primary" type="submit">Save Settings</button>
     </form>
+  </div>
+  <div class="card">
+    <h2>Promo Codes</h2>
+    <p class="muted small">Give a customer a code instead of negotiating discounts. "% off order" discounts the whole order (same effect as reducing all product prices); "RM off order" takes a fixed amount off.</p>
+    <form method="post" action="/admin/promos" class="stack">
+      <div class="grid-fields">
+        <label>Code<input name="code" required maxlength="30" placeholder="SAVE10" style="text-transform:uppercase"></label>
+        <label>Type
+          <select name="kind"><option value="percent">% off order</option><option value="fixed">RM off order</option></select></label>
+        <label>Value<input name="value" type="number" step="0.01" min="0.01" required placeholder="10"></label>
+        <label>Expires (optional)<input name="expires" type="date" min="${klDatePlus(1)}"></label>
+        <label>Max uses (0 = unlimited)<input name="max_uses" type="number" step="1" min="0" value="0"></label>
+      </div>
+      <button class="btn btn-primary" type="submit">Create Promo Code</button>
+    </form>
+    ${(() => {
+      const promos = db.prepare('SELECT * FROM promo_codes ORDER BY active DESC, id DESC').all();
+      if (!promos.length) return '';
+      return `<div class="table-wrap" style="margin-top:1rem"><table class="table">
+        <thead><tr><th>Code</th><th>Discount</th><th>Expires</th><th class="num">Used</th><th>Status</th><th></th></tr></thead>
+        <tbody>${promos.map((p) => `<tr class="${p.active ? '' : 'inactive'}">
+          <td data-label="Code"><code>${V.esc(p.code)}</code></td>
+          <td data-label="Discount">${p.kind === 'percent' ? p.value + '% off order' : V.rm(p.value) + ' off order'}</td>
+          <td data-label="Expires">${p.expires ? V.esc(fmtDay(p.expires)) : 'Never'}</td>
+          <td data-label="Used" class="num">${p.used_count}${p.max_uses > 0 ? ' / ' + p.max_uses : ''}</td>
+          <td data-label="Status">${p.active ? '<span class="badge badge-confirmed">Active</span>' : '<span class="badge">Disabled</span>'}</td>
+          <td data-label=""><form method="post" action="/admin/promos/${p.id}/toggle" class="inline-form">
+            <button class="btn btn-ghost btn-sm" type="submit">${p.active ? 'Disable' : 'Enable'}</button></form></td>
+        </tr>`).join('')}</tbody></table></div>`;
+    })()}
   </div>`;
   render(req, res, { title: 'Admin - Customers', user: req.user, body, active: 'customers' });
 });
@@ -2207,6 +2270,34 @@ app.post('/admin/settings', requireAdmin, (req, res) => {
   setSetting('express_percent', isNaN(expPct) || expPct < 0 ? '0' : String(Math.min(expPct, 100)));
   setSetting('express_lead_days', isNaN(expDays) || expDays < 0 ? '1' : String(Math.min(expDays, 30)));
   flash(req, 'success', 'Settings saved. They apply to new orders and new quotations only.');
+  res.redirect('/admin/customers');
+});
+
+app.post('/admin/promos', requireAdmin, (req, res) => {
+  const code = String(req.body.code || '').trim().toUpperCase().slice(0, 30).replace(/[^A-Z0-9-]/g, '');
+  const kind = req.body.kind === 'fixed' ? 'fixed' : 'percent';
+  const value = round2(parseFloat(req.body.value));
+  const maxUses = Math.max(0, parseInt(req.body.max_uses, 10) || 0);
+  const expires = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.expires || '')) ? req.body.expires : '';
+  if (!code || isNaN(value) || value <= 0 || (kind === 'percent' && value > 100)) {
+    flash(req, 'error', 'Promo code needs a code and a valid value (percent must be 1-100).');
+    return res.redirect('/admin/customers');
+  }
+  try {
+    db.prepare('INSERT INTO promo_codes (code, kind, value, expires, max_uses) VALUES (?,?,?,?,?)')
+      .run(code, kind, value, expires, maxUses);
+    flash(req, 'success', `Promo code ${code} created: ${kind === 'percent' ? value + '% off' : V.rm(value) + ' off'} the order.`);
+  } catch (e) {
+    flash(req, 'error', 'That promo code already exists.');
+  }
+  res.redirect('/admin/customers');
+});
+
+app.post('/admin/promos/:id/toggle', requireAdmin, (req, res) => {
+  const p = db.prepare('SELECT * FROM promo_codes WHERE id = ?').get(req.params.id);
+  if (!p) return res.status(404).send('Not found');
+  db.prepare('UPDATE promo_codes SET active = ? WHERE id = ?').run(p.active ? 0 : 1, p.id);
+  flash(req, 'success', `Promo code ${p.code} ${p.active ? 'disabled' : 'enabled'}.`);
   res.redirect('/admin/customers');
 });
 

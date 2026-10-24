@@ -56,9 +56,12 @@ CREATE TABLE IF NOT EXISTS orders (
   order_no TEXT NOT NULL UNIQUE,
   invoice_no TEXT NOT NULL UNIQUE,
   customer_id INTEGER NOT NULL REFERENCES users(id),
+  job_name TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'submitted'
     CHECK (status IN ('submitted','needs_revision','confirmed','completed','delivered','cancelled')),
   subtotal REAL NOT NULL DEFAULT 0,
+  promo_code TEXT DEFAULT '',
+  discount_amount REAL NOT NULL DEFAULT 0,
   is_express INTEGER NOT NULL DEFAULT 0,
   express_percent REAL NOT NULL DEFAULT 0,
   express_amount REAL NOT NULL DEFAULT 0,
@@ -85,6 +88,7 @@ CREATE TABLE IF NOT EXISTS orders (
   chk_product INTEGER NOT NULL DEFAULT 0,
   chk_payment INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   confirmed_at TEXT,
   completed_at TEXT,
   delivered_at TEXT,
@@ -185,6 +189,18 @@ CREATE TABLE IF NOT EXISTS comments (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS promo_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  kind TEXT NOT NULL CHECK (kind IN ('percent','fixed')),
+  value REAL NOT NULL,
+  expires TEXT DEFAULT '',
+  max_uses INTEGER NOT NULL DEFAULT 0,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -217,6 +233,10 @@ ensureColumn('orders', 'cancel_reason', "cancel_reason TEXT DEFAULT ''");
 ensureColumn('orders', 'cancelled_at', 'cancelled_at TEXT');
 ensureColumn('orders', 'revision_reason', "revision_reason TEXT DEFAULT ''");
 ensureColumn('orders', 'quote_id', 'quote_id INTEGER REFERENCES quotes(id)');
+ensureColumn('orders', 'job_name', "job_name TEXT NOT NULL DEFAULT ''");
+ensureColumn('orders', 'promo_code', "promo_code TEXT DEFAULT ''");
+ensureColumn('orders', 'discount_amount', 'discount_amount REAL NOT NULL DEFAULT 0');
+ensureColumn('orders', 'updated_at', "updated_at TEXT NOT NULL DEFAULT ''");
 ensureColumn('orders', 'refund_status', "refund_status TEXT NOT NULL DEFAULT ''");
 ensureColumn('orders', 'refund_ref', "refund_ref TEXT DEFAULT ''");
 ensureColumn('orders', 'refund_note', "refund_note TEXT DEFAULT ''");
@@ -235,27 +255,23 @@ if (userCount === 0) {
 
 const productCount = db.prepare('SELECT COUNT(*) AS n FROM products').get().n;
 if (productCount === 0) {
-  const ins = db.prepare(
-    'INSERT INTO products (name, description, unit, base_price, moq, artwork_spec) VALUES (?,?,?,?,?,?)'
-  );
-  const tier = db.prepare('INSERT INTO price_tiers (product_id, min_qty, price) VALUES (?,?,?)');
-  let r;
-  r = ins.run('Cotton T-Shirt (Custom Print)', 'Full-colour custom printed cotton t-shirt', 'pcs', 25.0, 10,
-    'AI/PDF vector or 300dpi PNG, include size breakdown in notes');
-  tier.run(r.lastInsertRowid, 50, 22.5);
-  tier.run(r.lastInsertRowid, 100, 19.9);
-  r = ins.run('Microfiber Towel (Custom)', 'Custom dyed/printed microfiber towel', 'pcs', 12.5, 20,
-    '300dpi PNG or AI file, full-bleed with 3mm margin');
-  tier.run(r.lastInsertRowid, 100, 11.0);
-  r = ins.run('Tote Bag (Silkscreen)', 'Canvas tote bag with silkscreen print', 'pcs', 8.0, 50,
-    'Vector AI/PDF only (silkscreen), max 3 colours');
-  tier.run(r.lastInsertRowid, 200, 7.0);
-  r = ins.run('Lanyard (Full Sublimation)', '20mm full sublimation lanyard with hook', 'pcs', 3.5, 100,
-    'AI template available on request, text converted to outlines');
-  tier.run(r.lastInsertRowid, 500, 3.0);
-  tier.run(r.lastInsertRowid, 1000, 2.6);
-  r = ins.run('Banner (Per Metre)', 'Heavy-duty printed fabric banner', 'metre', 45.0, 1,
-    '300dpi JPG/PDF at actual size');
+  const NAMES = [
+    'Roundneck Short Sleeve', 'Roundneck Long Sleeve', 'Roundneck Long Sleeve (Kids)',
+    'Roundneck Short Sleeve (Kids)', 'Roundneck Sleeveless',
+    'Vneck Short Sleeve', 'Vneck Long Sleeve', 'Vneck Short Sleeve (Kids)',
+    'Vneck Long Sleeve (Kids)', 'Vneck Sleeveless',
+    'Polo Short Sleeve', 'Polo Long Sleeve', 'Polo Short Sleeve (Kids)',
+    'Mandarin Short Sleeve', 'Mandarin Long Sleeve',
+    'Retro Short Sleeve', 'Retro Short Sleeve (Kids)', 'Retro Long Sleeve',
+    'NFL Short Sleeve', 'NFL Long Sleeve', 'NFL Short Sleeve (Kids)',
+    'Muslimah', 'Muslimah (Kids)',
+    'Raglan Short Sleeve', 'Raglan Long Sleeve', 'Raglan Short Sleeve (Kids)',
+    'Uniform Short Sleeve', 'Uniform Long Sleeve',
+    'Short Pants', 'Long Pants', 'Pants (Kids)',
+    'Add On Pocket', 'Add On Zip', 'Flag',
+  ];
+  const ins = db.prepare("INSERT INTO products (name, unit, base_price, moq) VALUES (?, 'pcs', 0, 1)");
+  for (const n of NAMES) ins.run(n);
 }
 
 function setting(key, fallback) {
@@ -282,6 +298,17 @@ function nextInvoiceNo() {
   setSetting('invoice_seq', next);
   return next;
 }
+// Random, non-guessable order number so customers cannot infer daily volume.
+function randomOrderNo() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (;;) {
+    let s = '';
+    for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * chars.length)];
+    const no = 'ORD-' + s;
+    if (!db.prepare('SELECT 1 FROM orders WHERE order_no = ?').get(no)) return no;
+  }
+}
+
 function nextQuoteNo() {
   const next = parseInt(setting('quote_seq', '5000'), 10) + 1;
   setSetting('quote_seq', next);
@@ -327,9 +354,14 @@ function creditBalance(customerId) {
 function logEvent(orderId, actor, event, note) {
   db.prepare('INSERT INTO status_log (order_id, actor_name, actor_role, event, note) VALUES (?,?,?,?,?)')
     .run(orderId, actor.name, actor.role, event, note || '');
+  touchOrder(orderId);
+}
+
+function touchOrder(orderId) {
+  db.prepare("UPDATE orders SET updated_at = datetime('now') WHERE id = ?").run(orderId);
 }
 
 module.exports = {
-  db, nextInvoiceNo, nextQuoteNo, priceFor, tiersFor, setting, setSetting,
-  paidFor, creditBalance, logEvent,
+  db, nextInvoiceNo, nextQuoteNo, randomOrderNo, priceFor, tiersFor, setting, setSetting,
+  paidFor, creditBalance, logEvent, touchOrder,
 };

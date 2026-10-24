@@ -89,7 +89,8 @@ function layout({ title, user, body, flash, active = '', whatsapp = '' }) {
 <header class="topbar">
   <div class="topbar-inner">
     <a class="brand" href="${user && user.role === 'admin' ? '/admin' : '/'}">
-      <span class="brand-mark">A</span> Aramega <span class="brand-sub">Order Portal</span>
+      <span class="brand-logo"><img src="https://www.aramega.com.my/wp-content/uploads/2022/12/cropped-cropped-cropped-cropped-imageedit_1_9771480102-e1672820391435.png" alt="Aramega" onerror="this.closest('.brand-logo').textContent='A'"></span>
+      Aramega <span class="brand-sub">Order Portal</span>
     </a>
     ${user ? `
     <input type="checkbox" id="nav-toggle" class="nav-toggle">
@@ -130,7 +131,7 @@ function loginPage({ error }) {
 </head>
 <body class="login-body">
 <div class="login-card">
-  <div class="login-logo"><span class="brand-mark big">A</span></div>
+  <div class="login-logo"><img src="https://www.aramega.com.my/wp-content/uploads/2022/12/cropped-cropped-cropped-cropped-imageedit_1_9771480102-e1672820391435.png" alt="Aramega Textile Sdn Bhd" class="login-logo-img" onerror="this.outerHTML='<span class=&quot;brand-mark big&quot;>A</span>'"></div>
   <h1>Aramega Order Portal</h1>
   <p class="muted">Sign in with the username and password provided to you.</p>
   ${error ? `<div class="flash flash-error">${esc(error)}</div>` : ''}
@@ -157,15 +158,16 @@ function ordersTable(orders, { adminView = false } = {}) {
   const base = adminView ? '/admin/orders/' : '/orders/';
   return `<div class="table-wrap"><table class="table">
 <thead><tr>
-  <th>Order #</th><th>Invoice #</th>${adminView ? '<th>Customer</th>' : ''}
-  <th>Date</th><th class="num">Total</th><th>Status</th><th></th>
+  <th>Order #</th><th>Job Name</th>${adminView ? '<th>Customer</th>' : ''}
+  <th>Date Submitted</th><th>Last Update</th><th class="num">Total</th><th>Status</th><th></th>
 </tr></thead>
 <tbody>
 ${orders.map((o) => `<tr>
-  <td data-label="Order #"><a href="${base}${o.id}">${esc(o.order_no)}</a></td>
-  <td data-label="Invoice #">${esc(o.invoice_no)}</td>
+  <td data-label="Order #"><a href="${base}${o.id}"><strong>${esc(o.order_no)}</strong></a><div class="muted small">${esc(o.invoice_no)}</div></td>
+  <td data-label="Job Name">${esc(o.job_name || '-')}</td>
   ${adminView ? `<td data-label="Customer">${esc(o.customer_name)}</td>` : ''}
-  <td data-label="Date">${esc(fmtDate(o.created_at))}</td>
+  <td data-label="Date Submitted">${esc(fmtDate(o.created_at))}</td>
+  <td data-label="Last Update">${esc(fmtDate(o.updated_at || o.created_at))}</td>
   <td data-label="Total" class="num">${rm(o.total)}</td>
   <td data-label="Status">${statusBadge(o.status)}${o.action_note ? `<div class="action-note">&#9888; ${esc(o.action_note)}</div>` : ''}</td>
   <td data-label=""><a class="btn btn-sm btn-outline" href="${base}${o.id}">View</a></td>
