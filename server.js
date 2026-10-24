@@ -416,7 +416,7 @@ app.get('/', requireCustomer, (req, res) => {
 // ---------- customer: new order ----------
 
 app.get('/orders/new', requireCustomer, (req, res) => {
-  const products = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY name').all();
+  const products = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY id').all();
   const leadDays = parseInt(setting('lead_days', '3'), 10);
   const minDate = klDatePlus(leadDays);
   const expressPct = parseFloat(setting('express_percent', '20')) || 0;
@@ -1074,7 +1074,7 @@ app.get('/quotes', requireCustomer, (req, res) => {
               FROM quotes q JOIN users u ON u.id = q.customer_id
               WHERE q.customer_id = ? ORDER BY q.id DESC`)
     .all(req.user.id);
-  const products = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY name').all();
+  const products = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY id').all();
   const pricing = {};
   const rows = products
     .map((p) => {
@@ -2042,7 +2042,7 @@ function saveTiers(productId, tiers) {
 }
 
 app.get('/admin/products', requireAdmin, (req, res) => {
-  const products = db.prepare('SELECT * FROM products ORDER BY active DESC, name').all();
+  const products = db.prepare('SELECT * FROM products ORDER BY active DESC, id').all();
   const rows = products
     .map(
       (p) => `<form method="post" action="/admin/products/${p.id}" enctype="multipart/form-data" class="product-row card ${p.active ? '' : 'inactive'}">
@@ -2351,7 +2351,7 @@ app.post('/admin/customers/:id/active', requireAdmin, (req, res) => {
 app.get('/admin/customers/:id/pricing', requireAdmin, (req, res) => {
   const c = db.prepare("SELECT * FROM users WHERE id = ? AND role = 'customer'").get(req.params.id);
   if (!c) return res.status(404).send('Customer not found');
-  const products = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY name').all();
+  const products = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY id').all();
   const overrides = {};
   for (const r of db.prepare('SELECT * FROM customer_prices WHERE customer_id = ?').all(c.id)) {
     overrides[r.product_id] = r.price;
