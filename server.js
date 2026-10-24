@@ -515,17 +515,17 @@ app.get('/orders/new', requireCustomer, (req, res) => {
       <p class="muted small">Credit is applied up to the order total; any remainder stays in your account.</p>
     </div>` : ''}
     <div class="card">
-      <h2>${credit > 0 ? '5' : '4'}. Promo Code (optional)</h2>
+      <h2>${credit > 0 ? '5' : '4'}. Notes (optional)</h2>
+      <label>Order notes
+        <textarea name="notes" rows="3" placeholder="Sizes breakdown, colours, delivery instructions..."></textarea>
+      </label>
+    </div>
+    <div class="card">
+      <h2>${credit > 0 ? '6' : '5'}. Promo Code (optional)</h2>
       <label style="max-width:300px">Promo code
         <input name="promo_code" maxlength="30" placeholder="e.g. SAVE10" style="text-transform:uppercase">
       </label>
       <p class="muted small">If we gave you a promo code, enter it here — the discount is applied on your invoice.</p>
-    </div>
-    <div class="card">
-      <h2>${credit > 0 ? '6' : '5'}. Notes (optional)</h2>
-      <label>Order notes
-        <textarea name="notes" rows="3" placeholder="Sizes breakdown, colours, delivery instructions..."></textarea>
-      </label>
     </div>
     <button class="btn btn-primary btn-lg" type="submit">Submit Order &amp; Generate Invoice</button>
   </form>
@@ -779,7 +779,8 @@ function artworkCard(order, { isAdmin }) {
 }
 
 function paymentsCard(order, { isAdmin }) {
-  const canPay = !isAdmin && ['submitted', 'needs_revision', 'confirmed', 'completed'].includes(order.status);
+  // Once confirmed, payment has been fully verified — no further customer payments.
+  const canPay = !isAdmin && ['submitted', 'needs_revision'].includes(order.status);
   return `
   <div class="card">
     <h2>Payments</h2>
@@ -939,8 +940,10 @@ app.post('/orders/:id/payment', requireCustomer, runUpload(uploadReceipt), (req,
     flash(req, 'error', msg);
     return res.redirect(`/orders/${order.id}`);
   };
-  if (!['submitted', 'needs_revision', 'confirmed', 'completed'].includes(order.status)) {
-    return bad('Payments can no longer be added to this order.');
+  // Rule: payments can only be submitted before confirmation — a confirmed order
+  // already has its full payment verified.
+  if (!['submitted', 'needs_revision'].includes(order.status)) {
+    return bad('This order is already confirmed with payment verified — no further payments are needed.');
   }
   const amount = round2(parseFloat(req.body.amount));
   if (isNaN(amount) || amount <= 0) return bad('Enter the amount you paid (greater than 0).');
