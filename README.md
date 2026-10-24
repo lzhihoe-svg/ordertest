@@ -26,15 +26,14 @@ A mobile/tablet/desktop-friendly order portal for Aramega Textile Sdn Bhd custom
 - Order discussion thread, admin cancellation with reason
 
 **Industry-standard flows (modelled on leading online printers)**
-- **Digital proof approval**: after confirming, admin uploads a print-ready proof; the customer must *Approve* or *Request Changes* (with a note). The order cannot be marked complete while a proof is unapproved — production never starts on an unchecked design
-- **Custom quote requests (RFQ)**: customers request quotes for jobs outside the product list (description + reference file up to 100MB or link); admin prices it line by line with a validity date; accepting converts it straight into a real order with an invoice, carrying the reference files over as artwork
+- **Instant quotations**: customers generate a priced quotation themselves (their account prices + bulk tiers, auto-numbered QUO-xxxx, printable/PDF) — no waiting for admin. Quotes have a configurable validity (default 14 days) and convert into a real order + invoice in one click, with artwork required at conversion
 - **Rush orders**: optional express service with a configurable surcharge % and shorter lead time, shown live in the order total and on the invoice
 - **Artwork templates**: admin attaches a template file (AI/PDF/ZIP/PSD) per product; customers download it right from the order form
 - **Default delivery address** saved on the customer account, prefilled on courier orders
 
 **Payments, revisions & money handling**
 - **Payments ledger**: customers submit each payment with an amount + receipt file; admin verifies or rejects (with a reason); admin can also record bank-statement/cash payments manually. Orders show Total / Paid / Balance Due
-- **Deposit rule**: a configurable deposit % (default 50%) in verified payments is required before an order can be confirmed; **full payment is required before delivery**
+- **Full-payment rule**: verified payments must cover the full order total before the order can be confirmed (no deposits); re-checked at confirmation time
 - **Revision requests**: instead of cancelling a problematic order, admin sends it back as *Revision Requested* with a reason; the customer fixes artwork and **resubmits**
 - **Cancelled-with-payment resolution**: if a cancelled order has verified payments, admin must resolve it — record a **bank refund** (with transfer ref) or convert it to **store credit**
 - **Store credit**: credited amounts live on the customer's account and can be applied automatically to the next order (counts toward the deposit)
@@ -49,14 +48,13 @@ A mobile/tablet/desktop-friendly order portal for Aramega Textile Sdn Bhd custom
 3. Needed-by date must respect the configurable **production lead time**
 4. **Courier delivery requires an address**; marking a courier order delivered requires a **tracking number**
 5. A customer payment submission requires an **amount + receipt file**, and cannot exceed the balance due
-6. Admin cannot tick "payment received" (or confirm) until **verified payments cover the deposit %**
-7. Confirming an order requires all 3 verification checks **and an estimated ready date**; the deposit is re-checked at confirm time
+6. Admin cannot tick "payment received" (or confirm) until **verified payments cover the full order total**
+7. Confirming an order requires all 3 verification checks **and an estimated ready date**; full payment is re-checked at confirm time
 8. **Full payment before delivery** — a courier order additionally needs a tracking number
 9. Rejecting a payment requires a reason (shown to the customer); a bank refund requires the transfer reference
 10. Customers can cancel (with a reason) **only before confirmation**; admin can cancel before completion; money on a cancelled order must be resolved (refund or credit) exactly once
-11. SST %, deposit %, rush surcharge and lead time are snapshotted/validated per order — changing settings never alters old invoices
-12. Once a proof is sent, **production cannot complete until the customer approves it**; change requests require a note
-13. A quote needs priced lines and a future validity date to be sent; it can only be **accepted while valid**, and only once; declining (either side) requires a reason
+11. SST %, rush surcharge and lead time are snapshotted/validated per order — changing settings never alters old invoices
+12. A quotation can only be **converted while valid**, and only once; conversion locks the quoted prices and requires artwork like any order
 
 ## Run
 

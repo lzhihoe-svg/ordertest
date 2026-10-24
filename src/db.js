@@ -76,9 +76,6 @@ CREATE TABLE IF NOT EXISTS orders (
   eta_date TEXT DEFAULT '',
   cancel_reason TEXT DEFAULT '',
   revision_reason TEXT DEFAULT '',
-  proof_status TEXT NOT NULL DEFAULT '' CHECK (proof_status IN ('','pending','approved','changes')),
-  proof_note TEXT DEFAULT '',
-  proof_decided_at TEXT,
   quote_id INTEGER REFERENCES quotes(id),
   refund_status TEXT NOT NULL DEFAULT '' CHECK (refund_status IN ('','refunded','credited')),
   refund_ref TEXT DEFAULT '',
@@ -109,24 +106,25 @@ CREATE TABLE IF NOT EXISTS quotes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   quote_no TEXT NOT NULL UNIQUE,
   customer_id INTEGER NOT NULL REFERENCES users(id),
-  title TEXT NOT NULL,
-  description TEXT NOT NULL,
-  ref_link TEXT DEFAULT '',
-  needed_by TEXT DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'requested'
-    CHECK (status IN ('requested','quoted','accepted','declined')),
+  title TEXT NOT NULL DEFAULT '',
+  notes TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'quoted'
+    CHECK (status IN ('quoted','accepted','declined')),
+  subtotal REAL NOT NULL DEFAULT 0,
+  sst_percent REAL NOT NULL DEFAULT 0,
+  sst_amount REAL NOT NULL DEFAULT 0,
+  total REAL NOT NULL DEFAULT 0,
   valid_until TEXT DEFAULT '',
-  admin_note TEXT DEFAULT '',
   decline_reason TEXT DEFAULT '',
   order_id INTEGER REFERENCES orders(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  quoted_at TEXT,
   decided_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS quote_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   quote_id INTEGER NOT NULL REFERENCES quotes(id),
+  product_id INTEGER REFERENCES products(id),
   description TEXT NOT NULL,
   unit TEXT NOT NULL DEFAULT 'pcs',
   qty INTEGER NOT NULL,
@@ -138,7 +136,7 @@ CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   order_id INTEGER REFERENCES orders(id),
   quote_id INTEGER REFERENCES quotes(id),
-  kind TEXT NOT NULL CHECK (kind IN ('artwork','receipt','delivery','proof','quote_ref')),
+  kind TEXT NOT NULL CHECK (kind IN ('artwork','receipt','delivery')),
   stored_name TEXT NOT NULL,
   original_name TEXT NOT NULL,
   size INTEGER NOT NULL DEFAULT 0,
@@ -218,9 +216,6 @@ ensureColumn('orders', 'eta_date', "eta_date TEXT DEFAULT ''");
 ensureColumn('orders', 'cancel_reason', "cancel_reason TEXT DEFAULT ''");
 ensureColumn('orders', 'cancelled_at', 'cancelled_at TEXT');
 ensureColumn('orders', 'revision_reason', "revision_reason TEXT DEFAULT ''");
-ensureColumn('orders', 'proof_status', "proof_status TEXT NOT NULL DEFAULT ''");
-ensureColumn('orders', 'proof_note', "proof_note TEXT DEFAULT ''");
-ensureColumn('orders', 'proof_decided_at', 'proof_decided_at TEXT');
 ensureColumn('orders', 'quote_id', 'quote_id INTEGER REFERENCES quotes(id)');
 ensureColumn('orders', 'refund_status', "refund_status TEXT NOT NULL DEFAULT ''");
 ensureColumn('orders', 'refund_ref', "refund_ref TEXT DEFAULT ''");
@@ -278,7 +273,7 @@ if (setting('quote_seq', null) === null) setSetting('quote_seq', '5000');
 if (setting('sst_percent', null) === null) setSetting('sst_percent', '0');
 if (setting('lead_days', null) === null) setSetting('lead_days', '3');
 if (setting('whatsapp', null) === null) setSetting('whatsapp', '');
-if (setting('deposit_percent', null) === null) setSetting('deposit_percent', '50');
+if (setting('quote_valid_days', null) === null) setSetting('quote_valid_days', '14');
 if (setting('express_percent', null) === null) setSetting('express_percent', '20');
 if (setting('express_lead_days', null) === null) setSetting('express_lead_days', '1');
 
