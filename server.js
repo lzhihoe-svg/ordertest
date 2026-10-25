@@ -100,10 +100,11 @@ function round2(n) {
 }
 
 // Validate a promo code; returns {promo} or {error}.
-function checkPromo(code) {
+function checkPromo(code, customerId) {
   if (!code) return { promo: null };
   const p = db.prepare('SELECT * FROM promo_codes WHERE code = ?').get(code);
   if (!p || !p.active) return { error: 'That promo code is not valid.' };
+  if (p.customer_id && p.customer_id !== customerId) return { error: 'That promo code is not valid.' };
   if (p.expires && p.expires < klDatePlus(0)) return { error: 'That promo code has expired.' };
   if (p.max_uses > 0 && p.used_count >= p.max_uses) return { error: 'That promo code has been fully used.' };
   return { promo: p };
@@ -432,9 +433,10 @@ app.get('/', requireCustomer, (req, res) => {
   const banners = db.prepare('SELECT * FROM banners WHERE active = 1 ORDER BY id DESC').all();
   const promos = db
     .prepare(`SELECT * FROM promo_codes WHERE active = 1 AND is_public = 1
+              AND (customer_id IS NULL OR customer_id = ?)
               AND (expires = '' OR expires >= ?) AND (max_uses = 0 OR used_count < max_uses)
               ORDER BY id DESC`)
-    .all(klDatePlus(0));
+    .all(req.user.id, klDatePlus(0));
 
   const hero = banners.length
     ? `<div class="hero" id="hero">
@@ -487,7 +489,8 @@ app.get('/', requireCustomer, (req, res) => {
       ${promos.length ? `<div class="promo-scroll">${promos.map((p) => `
       <div class="promo-card">
         <div><code class="promo-code">${V.esc(p.code)}</code>
-          <span class="promo-desc">${p.kind === 'percent' ? p.value + '% off your entire order' : V.rm(p.value) + ' off your entire order'}</span></div>
+          <span class="promo-desc">${p.kind === 'percent' ? p.value + '% off your entire order' : V.rm(p.value) + ' off your entire order'}</span>
+          ${p.customer_id ? '<span class="badge badge-completed">Just for you</span>' : ''}</div>
         <span class="muted small">${p.expires ? 'Until ' + V.esc(fmtDay(p.expires)) : 'Limited time'} &middot; enter at checkout</span>
       </div>`).join('')}</div>` : '<p class="muted">No promotions right now — check back soon.</p>'}
     </div>
@@ -577,7 +580,6 @@ app.get('/invoices', requireCustomer, (req, res) => {
     <td data-label="Invoice #"><a href="/orders/${o.id}/invoice" target="_blank"><strong>${V.esc(o.invoice_no)}</strong></a></td>
     <td data-label="Order #"><a href="/orders/${o.id}">${V.esc(o.order_no)}</a><div class="muted small">${V.esc(o.job_name || '')}</div></td>
     <td data-label="Order Date">${V.esc(V.fmtDate(o.created_at))}</td>
-    <td data-label="Items" class="num">${o.item_count}</td>
     <td data-label="Total" class="num">${V.rm(o.total)}</td>
     <td data-label="Status">${o.status === 'cancelled' ? '<span class="badge badge-cancelled">Cancelled</span>' : V.statusBadge(o.status)}</td>
     <td data-label=""><a class="btn btn-sm btn-primary" href="/orders/${o.id}/invoice?download=1" target="_blank">Download Invoice</a></td>
@@ -588,7 +590,7 @@ app.get('/invoices', requireCustomer, (req, res) => {
     <p class="muted">Every invoice in one place for your own accounting — click Download Invoice to save the PDF instantly.</p></div>
   </div>
   ${orders.length ? `<div class="table-wrap"><table class="table">
-    <thead><tr><th>Invoice #</th><th>Order #</th><th>Order Date</th><th class="num">No. of Items</th><th class="num">Total</th><th>Status</th><th></th></tr></thead>
+    <thead><tr><th>Invoice #</th><th>Order #</th><th>Order Date</th><th class="num">Total</th><th>Status</th><th></th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>` : '<div class="empty">No invoices yet. Invoices are generated automatically when you place an order.</div>'}`;
   render(req, res, { title: 'My Invoices', user: req.user, body, active: 'invoices' });
@@ -605,6 +607,27 @@ app.get('/banners/:id/image', (req, res) => {
   if (!stored) return res.status(404).send('Not found');
   res.sendFile(path.join(UPLOAD_DIR, stored));
 });
+
+// Live promo validation for the order form (customer-specific codes included).
+app.get('/promo/check', requireCustomer, (req, res) => {
+  const code = String(req.query.code || '').trim().toUpperCase().slice(0, 30);
+  const r = checkPromo(code, req.user.id);
+  if (!r.promo) return res.json({ ok: false, error: r.error || 'Enter a promo code.' });
+  const p = r.promo;
+  res.json({
+    ok: true, kind: p.kind, value: p.value,
+    label: p.kind === 'percent' ? `${p.code} applied: ${p.value}% off your order` : `${p.code} applied: RM ${p.value} off your order`,
+  });
+});
+
+// Product grouping for the order and quotation builders.
+function productGroup(p) {
+  if (/^Add On/i.test(p.name)) return 'Add Ons';
+  if (p.name === 'Flag') return 'Extra Products';
+  if (/\(Kids\)/i.test(p.name)) return 'Kids';
+  return 'Garments';
+}
+const GROUP_ORDER = ['Garments', 'Kids', 'Add Ons', 'Extra Products'];
 
 // ---------- customer: new order ----------
 
@@ -628,15 +651,20 @@ app.get('/orders/new', requireCustomer, (req, res) => {
   }
 
   const pricing = {};
-  const rows = products
-    .map((p) => {
-      const override = db
-        .prepare('SELECT price FROM customer_prices WHERE customer_id = ? AND product_id = ?')
-        .get(req.user.id, p.id);
-      const tiers = tiersFor(p.id);
-      pricing[p.id] = { base: p.base_price, moq: p.moq, override: override ? override.price : null, tiers };
-      const startPrice = priceFor(req.user.id, p.id, p.moq);
-      return `<tr>
+  const groups = { Garments: [], Kids: [], 'Add Ons': [], 'Extra Products': [] };
+  for (const p of products) {
+    const override = db
+      .prepare('SELECT price FROM customer_prices WHERE customer_id = ? AND product_id = ?')
+      .get(req.user.id, p.id);
+    // Effective price resolves override/fixed/base+offset; tiers only apply without an override or fixed price.
+    pricing[p.id] = {
+      base: priceFor(req.user.id, p.id, 1),
+      moq: p.moq,
+      override: null,
+      tiers: override || p.fixed_price != null ? [] : tiersFor(p.id),
+    };
+    const startPrice = priceFor(req.user.id, p.id, p.moq);
+    groups[productGroup(p)].push(`<tr>
         <td data-label="Product"><strong>${V.esc(p.name)}</strong></td>
         <td data-label="Your Price" class="num price-cell" id="price_${p.id}">${V.rm(startPrice)} / ${V.esc(p.unit)}</td>
         <td data-label="Quantity" class="qty-cell">
@@ -644,8 +672,10 @@ app.get('/orders/new', requireCustomer, (req, res) => {
             value="${prefill[p.id] || 0}" inputmode="numeric">
         </td>
         <td data-label="Subtotal" class="num subtotal-cell" id="sub_${p.id}">RM 0.00</td>
-      </tr>`;
-    })
+      </tr>`);
+  }
+  const rows = GROUP_ORDER.filter((g) => groups[g].length)
+    .map((g) => `<tr class="prod-group"><td colspan="4">${g}</td></tr>` + groups[g].join(''))
     .join('');
 
   const sst = parseFloat(setting('sst_percent', '0'));
@@ -716,8 +746,9 @@ app.get('/orders/new', requireCustomer, (req, res) => {
     <div class="card">
       <h2>${credit > 0 ? '6' : '5'}. Promo Code (optional)</h2>
       <label style="max-width:300px">Promo code
-        <input name="promo_code" maxlength="30" placeholder="e.g. SAVE10" style="text-transform:uppercase">
+        <input name="promo_code" id="promo-code" maxlength="30" placeholder="e.g. SAVE10" style="text-transform:uppercase" autocomplete="off">
       </label>
+      <p class="small" id="promo-note" style="margin:0.45rem 0 0"></p>
       <p class="muted small">If we gave you a promo code, enter it here — the discount is applied on your invoice.</p>
     </div>
     <button class="btn btn-primary btn-lg" type="submit">Submit Order &amp; Generate Invoice</button>
@@ -738,6 +769,7 @@ app.get('/orders/new', requireCustomer, (req, res) => {
       for (const t of p.tiers) if (qty >= t.min_qty) price = t.price;
       return price;
     }
+    let PROMO = null, promoTimer = null;
     function recalc() {
       let subtotal = 0;
       form.querySelectorAll('.qty-input').forEach(inp => {
@@ -752,18 +784,45 @@ app.get('/orders/new', requireCustomer, (req, res) => {
       });
       const isExpress = expressBox && expressBox.checked;
       const expressAmt = isExpress ? subtotal * EXPRESS_PCT / 100 : 0;
-      const sstAmt = (subtotal + expressAmt) * SST / 100;
+      // Same math as the server: discount on subtotal+rush, SST after discount.
+      const chargeBase = subtotal + expressAmt;
+      const disc = PROMO ? Math.min(PROMO.kind === 'percent' ? chargeBase * PROMO.value / 100 : PROMO.value, chargeBase) : 0;
+      const sstAmt = (chargeBase - disc) * SST / 100;
+      const total = chargeBase - disc + sstAmt;
       const elS = document.getElementById('f-subtotal');
       if (elS) elS.textContent = fmt(subtotal);
       const rowE = document.getElementById('express-row');
       if (rowE) { rowE.style.display = isExpress ? '' : 'none';
         document.getElementById('f-express').textContent = fmt(expressAmt); }
+      const rowD = document.getElementById('disc-row');
+      if (rowD) { rowD.style.display = disc > 0 ? '' : 'none';
+        document.getElementById('f-disc').textContent = '- ' + fmt(disc); }
       const elT = document.getElementById('f-sst');
       if (elT) elT.textContent = fmt(sstAmt);
-      document.getElementById('order-total').textContent = fmt(subtotal + expressAmt + sstAmt);
+      document.getElementById('order-total').textContent = fmt(total);
+      const note = document.getElementById('promo-note');
+      if (note && PROMO) {
+        note.className = 'small promo-ok';
+        note.innerHTML = PROMO.label + ' &mdash; <strong>new total after discount: ' + fmt(total) + '</strong>';
+      }
       const nb = document.getElementById('needed-by');
       nb.min = isExpress ? EXPRESS_MIN : MIN_DATE;
     }
+    const promoInput = document.getElementById('promo-code');
+    function checkPromoCode() {
+      const code = promoInput.value.trim().toUpperCase();
+      const note = document.getElementById('promo-note');
+      if (!code) { PROMO = null; note.textContent = ''; recalc(); return; }
+      fetch('/promo/check?code=' + encodeURIComponent(code))
+        .then(r => r.json())
+        .then(j => {
+          if (j.ok) { PROMO = j; }
+          else { PROMO = null; note.className = 'small promo-bad'; note.textContent = j.error; }
+          recalc();
+        })
+        .catch(() => {});
+    }
+    promoInput.addEventListener('input', () => { clearTimeout(promoTimer); promoTimer = setTimeout(checkPromoCode, 350); });
     form.addEventListener('input', recalc);
     recalc();
     form.addEventListener('submit', (e) => {
@@ -835,7 +894,7 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
 
   // Promo code (optional).
   const promoCode = String(req.body.promo_code || '').trim().toUpperCase().slice(0, 30);
-  const promoCheck = checkPromo(promoCode);
+  const promoCheck = checkPromo(promoCode, req.user.id);
   if (promoCheck.error) return fail(promoCheck.error);
   const promo = promoCheck.promo;
 
@@ -1269,20 +1328,26 @@ app.get('/quotes', requireCustomer, (req, res) => {
     .all(req.user.id);
   const products = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY id').all();
   const pricing = {};
-  const rows = products
-    .map((p) => {
-      const override = db
-        .prepare('SELECT price FROM customer_prices WHERE customer_id = ? AND product_id = ?')
-        .get(req.user.id, p.id);
-      const tiers = tiersFor(p.id);
-      pricing[p.id] = { base: p.base_price, moq: p.moq, override: override ? override.price : null, tiers };
-      return `<tr>
+  const groups = { Garments: [], Kids: [], 'Add Ons': [], 'Extra Products': [] };
+  for (const p of products) {
+    const override = db
+      .prepare('SELECT price FROM customer_prices WHERE customer_id = ? AND product_id = ?')
+      .get(req.user.id, p.id);
+    pricing[p.id] = {
+      base: priceFor(req.user.id, p.id, 1),
+      moq: p.moq,
+      override: null,
+      tiers: override || p.fixed_price != null ? [] : tiersFor(p.id),
+    };
+    groups[productGroup(p)].push(`<tr>
         <td data-label="Product"><strong>${V.esc(p.name)}</strong></td>
         <td data-label="Your Price" class="num" id="qprice_${p.id}">${V.rm(priceFor(req.user.id, p.id, p.moq))} / ${V.esc(p.unit)}</td>
         <td data-label="Quantity"><input class="qty-input" type="number" name="qty_${p.id}" data-pid="${p.id}" min="0" step="1" value="0" inputmode="numeric"></td>
         <td data-label="Subtotal" class="num" id="qsub_${p.id}">RM 0.00</td>
-      </tr>`;
-    })
+      </tr>`);
+  }
+  const rows = GROUP_ORDER.filter((g) => groups[g].length)
+    .map((g) => `<tr class="prod-group"><td colspan="4">${g}</td></tr>` + groups[g].join(''))
     .join('');
   const sst = parseFloat(setting('sst_percent', '0'));
   const validDays = parseInt(setting('quote_valid_days', '14'), 10);
@@ -2491,7 +2556,8 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
     <form method="post" action="/admin/banners" enctype="multipart/form-data" class="stack">
       <div class="grid-fields">
         <label>Title <span class="req-chip">Required</span><input name="title" required maxlength="100" placeholder="e.g. New Retro Series now available!"></label>
-        <label>Text (optional)<input name="body" maxlength="200" placeholder="e.g. Fresh colours, same great prices. Order yours today."></label>
+        <label>Text (optional) <span class="muted small">(keep it short — max 60 characters, like the example)</span>
+          <input name="body" maxlength="60" placeholder="e.g. Fresh colours, same great prices. Order yours today."></label>
         <label>Button text <span class="muted small">(default: Order Now)</span><input name="button_label" maxlength="30" placeholder="Order Now"></label>
         <label>Button link (optional — defaults to New Order)<input name="link_url" type="url" placeholder="https://..."></label>
       </div>
@@ -2542,6 +2608,9 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
         <label>Value<input name="value" type="number" step="0.01" min="0.01" required placeholder="10"></label>
         <label>Expires (optional)<input name="expires" type="date" min="${klDatePlus(1)}"></label>
         <label>Max uses (0 = unlimited)<input name="max_uses" type="number" step="1" min="0" value="0"></label>
+        <label>For customer
+          <select name="customer_id"><option value="">All customers</option>
+          ${customers.filter((c) => c.active).map((c) => `<option value="${c.id}">${V.esc(c.name)}${c.company ? ' — ' + V.esc(c.company) : ''}</option>`).join('')}</select></label>
       </div>
       <label class="check"><input type="checkbox" name="is_public" value="1">
         Show on customer homepage (promotions section)</label>
@@ -2551,10 +2620,11 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
       const promos = db.prepare('SELECT * FROM promo_codes ORDER BY active DESC, id DESC').all();
       if (!promos.length) return '';
       return `<div class="table-wrap" style="margin-top:1rem"><table class="table">
-        <thead><tr><th>Code</th><th>Discount</th><th>Expires</th><th class="num">Used</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Code</th><th>Discount</th><th>For</th><th>Expires</th><th class="num">Used</th><th>Status</th><th></th></tr></thead>
         <tbody>${promos.map((p) => `<tr class="${p.active ? '' : 'inactive'}">
           <td data-label="Code"><code>${V.esc(p.code)}</code></td>
           <td data-label="Discount">${p.kind === 'percent' ? p.value + '% off order' : V.rm(p.value) + ' off order'}</td>
+          <td data-label="For">${p.customer_id ? V.esc((db.prepare('SELECT name FROM users WHERE id = ?').get(p.customer_id) || { name: '?' }).name) : 'All customers'}</td>
           <td data-label="Expires">${p.expires ? V.esc(fmtDay(p.expires)) : 'Never'}</td>
           <td data-label="Used" class="num">${p.used_count}${p.max_uses > 0 ? ' / ' + p.max_uses : ''}</td>
           <td data-label="Status">${p.active ? '<span class="badge badge-confirmed">Active</span>' : '<span class="badge">Disabled</span>'}${p.is_public ? ' <span class="badge badge-completed">On homepage</span>' : ''}</td>
@@ -2600,7 +2670,7 @@ app.post('/admin/banners', requireAdmin, runUpload(uploadBanner), (req, res) => 
     (title, body, link_url, button_label, image_stored, image_name, image_stored_tablet, image_name_tablet, image_stored_mobile, image_name_mobile)
     VALUES (?,?,?,?,?,?,?,?,?,?)`).run(
     title,
-    String(req.body.body || '').trim().slice(0, 200),
+    String(req.body.body || '').trim().slice(0, 60),
     /^https?:\/\//i.test(link) ? link : '',
     String(req.body.button_label || '').trim().slice(0, 30),
     fd ? fd.filename : '', fd ? fd.originalname : '',
@@ -2641,9 +2711,13 @@ app.post('/admin/promos', requireAdmin, (req, res) => {
     return res.redirect('/admin/customers');
   }
   try {
-    db.prepare('INSERT INTO promo_codes (code, kind, value, expires, max_uses, is_public) VALUES (?,?,?,?,?,?)')
-      .run(code, kind, value, expires, maxUses, req.body.is_public ? 1 : 0);
-    flash(req, 'success', `Promo code ${code} created: ${kind === 'percent' ? value + '% off' : V.rm(value) + ' off'} the order.`);
+    const custId = parseInt(req.body.customer_id, 10);
+    const forCustomer = !isNaN(custId)
+      ? db.prepare("SELECT id, name FROM users WHERE id = ? AND role = 'customer'").get(custId)
+      : null;
+    db.prepare('INSERT INTO promo_codes (code, kind, value, expires, max_uses, is_public, customer_id) VALUES (?,?,?,?,?,?,?)')
+      .run(code, kind, value, expires, maxUses, req.body.is_public ? 1 : 0, forCustomer ? forCustomer.id : null);
+    flash(req, 'success', `Promo code ${code} created: ${kind === 'percent' ? value + '% off' : V.rm(value) + ' off'} the order${forCustomer ? ', only for ' + forCustomer.name : ''}.`);
   } catch (e) {
     flash(req, 'error', 'That promo code already exists.');
   }

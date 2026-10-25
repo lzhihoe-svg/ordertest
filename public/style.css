@@ -421,7 +421,8 @@ tr.inactive, .product-row.inactive { opacity: 0.55; }
   margin: 0; color: var(--ink); line-height: 1.55; font-size: 15px;
   -webkit-font-smoothing: antialiased;
 }
-.invoice-actions { max-width: 820px; margin: 0 auto 1.1rem; display: flex; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; }
+.invoice-actions { max-width: 820px; margin: 0 auto 1.1rem; display: flex; justify-content: flex-start; gap: 0.55rem; flex-wrap: wrap; }
+.invoice-actions .btn-ghost { margin-right: auto; }
 .invoice-sheet {
   max-width: 820px; margin: 0 auto; background: #fff; border-radius: 14px;
   border: 1px solid var(--border);
@@ -579,11 +580,11 @@ tr.inactive, .product-row.inactive { opacity: 0.55; }
 .hero-arrow {
   position: absolute; top: 50%; transform: translateY(-50%); z-index: 2;
   width: 40px; height: 40px; border-radius: 50%; border: none; cursor: pointer;
-  background: rgba(255,255,255,0.88); color: var(--lime-800); font-size: 1.05rem;
+  background: rgba(255,255,255,0.28); color: #fff; font-size: 1.05rem;
   box-shadow: 0 2px 10px rgba(26,46,5,0.35); display: none; align-items: center; justify-content: center;
   transition: background 0.15s var(--ease), transform 0.15s var(--ease);
 }
-.hero-arrow:hover { background: #fff; transform: translateY(-50%) scale(1.08); }
+.hero-arrow:hover { background: rgba(255,255,255,0.85); color: var(--lime-800); transform: translateY(-50%) scale(1.08); }
 .hero-prev { left: 0.9rem; }
 .hero-next { right: 0.9rem; }
 @media (min-width: 1025px) {
@@ -600,6 +601,14 @@ tr.inactive, .product-row.inactive { opacity: 0.55; }
 .chip:hover { border-color: var(--lime-400); }
 .chip.active { background: var(--lime-600); color: #fff; border-color: var(--lime-600); }
 .chip-n { opacity: 0.72; font-size: 0.8em; }
+.container-wide { max-width: 1440px; }
+.prod-group td {
+  background: var(--lime-50); color: var(--lime-800); font-weight: 800; font-size: 0.78rem;
+  text-transform: uppercase; letter-spacing: 0.08em; padding: 0.5rem 0.9rem !important;
+  border-top: 2px solid var(--lime-200);
+}
+.promo-ok { color: var(--lime-700); font-weight: 600; }
+.promo-bad { color: #b4232c; font-weight: 600; }
 /* paid chop + strip on the invoice */
 .invoice-sheet { position: relative; }
 .paid-strip {

@@ -106,7 +106,7 @@ function layout({ title, user, body, flash, active = '', whatsapp = '' }) {
     </nav>` : ''}
   </div>
 </header>
-<main class="container">
+<main class="container${user && user.role === 'admin' ? ' container-wide' : ''}">
 ${flashBlock(flash)}
 ${body}
 </main>

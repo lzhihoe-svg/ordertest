@@ -263,6 +263,7 @@ ensureColumn('banners', 'image_name_tablet', "image_name_tablet TEXT DEFAULT ''"
 ensureColumn('banners', 'image_stored_mobile', "image_stored_mobile TEXT DEFAULT ''");
 ensureColumn('banners', 'image_name_mobile', "image_name_mobile TEXT DEFAULT ''");
 ensureColumn('quotes', 'job_name', "job_name TEXT NOT NULL DEFAULT ''");
+ensureColumn('promo_codes', 'customer_id', 'customer_id INTEGER REFERENCES users(id)');
 
 // ---- seed ----
 const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
