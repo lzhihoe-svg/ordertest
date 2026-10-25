@@ -189,6 +189,17 @@ CREATE TABLE IF NOT EXISTS comments (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS banners (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  body TEXT DEFAULT '',
+  link_url TEXT DEFAULT '',
+  image_stored TEXT DEFAULT '',
+  image_name TEXT DEFAULT '',
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS promo_codes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   code TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -237,6 +248,7 @@ ensureColumn('orders', 'job_name', "job_name TEXT NOT NULL DEFAULT ''");
 ensureColumn('orders', 'promo_code', "promo_code TEXT DEFAULT ''");
 ensureColumn('orders', 'discount_amount', 'discount_amount REAL NOT NULL DEFAULT 0');
 ensureColumn('orders', 'updated_at', "updated_at TEXT NOT NULL DEFAULT ''");
+ensureColumn('promo_codes', 'is_public', 'is_public INTEGER NOT NULL DEFAULT 0');
 ensureColumn('orders', 'refund_status', "refund_status TEXT NOT NULL DEFAULT ''");
 ensureColumn('orders', 'refund_ref', "refund_ref TEXT DEFAULT ''");
 ensureColumn('orders', 'refund_note', "refund_note TEXT DEFAULT ''");

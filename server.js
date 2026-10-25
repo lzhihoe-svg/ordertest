@@ -172,6 +172,15 @@ const docFilter = (req, file, cb) => {
 };
 const uploadReceipt = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 }, fileFilter: docFilter }).single('receipt');
 const uploadDelivery = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 }, fileFilter: docFilter }).single('proof');
+const uploadBanner = multer({
+  storage,
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
+  fileFilter: (req, file, cb) => {
+    if (/\.(jpe?g|png|webp|gif)$/i.test(file.originalname)) return cb(null, true);
+    cb(new Error('Banner image must be jpg, png, webp or gif (max 8MB).'));
+  },
+}).single('image');
+
 const uploadTemplate = multer({
   storage,
   limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
@@ -396,6 +405,112 @@ app.get('/', requireCustomer, (req, res) => {
   const orders = db
     .prepare('SELECT * FROM orders WHERE customer_id = ? ORDER BY id DESC')
     .all(req.user.id);
+  const credit = creditBalance(req.user.id);
+
+  // attention list + rollups
+  const attention = [];
+  let inProgress = 0;
+  let balanceDue = 0;
+  for (const o of orders) {
+    if (['submitted', 'needs_revision', 'confirmed', 'completed'].includes(o.status)) inProgress++;
+    if (['submitted', 'confirmed', 'completed'].includes(o.status)) {
+      const bal = round2(o.total - paidFor(o));
+      if (bal > 0) {
+        balanceDue = round2(balanceDue + bal);
+        attention.push({ o, note: `Balance due ${V.rm(bal)} — pay within 3 hours of submission` });
+      }
+    }
+    if (o.status === 'needs_revision') attention.push({ o, note: 'Revision requested — fix and resubmit' });
+  }
+  const activeQuotes = db
+    .prepare("SELECT COUNT(*) AS n FROM quotes WHERE customer_id = ? AND status = 'quoted' AND valid_until >= ?")
+    .get(req.user.id, klDatePlus(0)).n;
+
+  const banners = db.prepare('SELECT * FROM banners WHERE active = 1 ORDER BY id DESC').all();
+  const promos = db
+    .prepare(`SELECT * FROM promo_codes WHERE active = 1 AND is_public = 1
+              AND (expires = '' OR expires >= ?) AND (max_uses = 0 OR used_count < max_uses)
+              ORDER BY id DESC`)
+    .all(klDatePlus(0));
+
+  const hero = banners.length
+    ? `<div class="hero" id="hero">
+        ${banners.map((b, i) => `
+        <div class="hero-slide ${i === 0 ? 'active' : ''}">
+          <div class="hero-text">
+            <h2 class="hero-title">${V.esc(b.title)}</h2>
+            ${b.body ? `<p class="hero-body">${V.esc(b.body)}</p>` : ''}
+            <a class="btn hero-btn" href="${b.link_url ? V.esc(b.link_url) : '/orders/new'}">${b.link_url ? 'Learn More' : 'Order Now'}</a>
+          </div>
+          ${b.image_stored ? `<div class="hero-img"><img src="/banners/${b.id}/image" alt="${V.esc(b.title)}"></div>` : ''}
+        </div>`).join('')}
+        ${banners.length > 1 ? `<div class="hero-dots">${banners.map((b, i) => `<button class="hero-dot ${i === 0 ? 'active' : ''}" data-i="${i}" aria-label="Banner ${i + 1}"></button>`).join('')}</div>` : ''}
+      </div>`
+    : `<div class="hero"><div class="hero-slide active"><div class="hero-text">
+        <h2 class="hero-title">Welcome back, ${V.esc(req.user.name)}</h2>
+        <p class="hero-body">Custom apparel printing at your own prices — order in minutes, invoice generated instantly.</p>
+        <a class="btn hero-btn" href="/orders/new">Order Now</a>
+      </div></div></div>`;
+
+  const body = `
+  ${hero}
+  <div class="stat-row">
+    <a href="/account" class="stat-card stat-link"><span class="stat-num">${V.rm(credit)}</span><span class="stat-label">Wallet / Store Credit</span></a>
+    <a href="/orders" class="stat-card stat-link"><span class="stat-num">${inProgress}</span><span class="stat-label">Orders In Progress</span></a>
+    <a href="/orders" class="stat-card stat-link"><span class="stat-num">${V.rm(balanceDue)}</span><span class="stat-label">Balance Due</span></a>
+    <a href="/quotes" class="stat-card stat-link"><span class="stat-num">${activeQuotes}</span><span class="stat-label">Active Quotations</span></a>
+  </div>
+  <div class="grid-2">
+    <div class="card">
+      <h2>Needs Your Attention</h2>
+      ${attention.length ? `<ul class="attn-list">${attention.map(({ o, note }) => `
+        <li><a href="/orders/${o.id}"><strong>${V.esc(o.order_no)}</strong> &middot; ${V.esc(o.job_name)}</a>
+        <div class="action-note">&#9888; ${V.esc(note)}</div></li>`).join('')}</ul>`
+        : '<p class="muted">Nothing pending — you are all caught up.</p>'}
+    </div>
+    <div class="card">
+      <h2>Current Promotions</h2>
+      ${promos.length ? promos.map((p) => `
+      <div class="promo-card">
+        <div><code class="promo-code">${V.esc(p.code)}</code>
+          <span class="promo-desc">${p.kind === 'percent' ? p.value + '% off your entire order' : V.rm(p.value) + ' off your entire order'}</span></div>
+        <span class="muted small">${p.expires ? 'Until ' + V.esc(fmtDay(p.expires)) : 'Limited time'} &middot; enter at checkout</span>
+      </div>`).join('') : '<p class="muted">No promotions right now — check back soon.</p>'}
+    </div>
+  </div>
+  <div class="page-head" style="margin-top:0.4rem">
+    <div><h2 style="margin:0">Recent Orders</h2></div>
+    <div class="head-actions">
+      <a class="btn btn-outline" href="/orders">View All Orders</a>
+      <a class="btn btn-primary" href="/orders/new">+ New Order</a>
+    </div>
+  </div>
+  ${V.ordersTable(orders.slice(0, 5))}
+  ${banners.length > 1 ? `<script>
+    (function () {
+      const slides = document.querySelectorAll('.hero-slide');
+      const dots = document.querySelectorAll('.hero-dot');
+      let i = 0, timer;
+      function show(n) {
+        i = n % slides.length;
+        slides.forEach((s, x) => s.classList.toggle('active', x === i));
+        dots.forEach((d, x) => d.classList.toggle('active', x === i));
+      }
+      function auto() { timer = setInterval(() => show(i + 1), 5000); }
+      dots.forEach((d) => d.addEventListener('click', () => { clearInterval(timer); show(+d.dataset.i); auto(); }));
+      auto();
+    })();
+  </script>` : ''}`;
+  render(req, res, { title: 'Home', user: req.user, body, active: 'home' });
+});
+
+// ---------- customer: my orders list ----------
+
+app.get('/orders', requireCustomer, (req, res) => {
+  sweepUnpaidOrders();
+  const orders = db
+    .prepare('SELECT * FROM orders WHERE customer_id = ? ORDER BY id DESC')
+    .all(req.user.id);
   for (const o of orders) {
     if (o.status === 'needs_revision') o.action_note = 'Action needed: revise and resubmit';
     else if (['submitted', 'confirmed', 'completed'].includes(o.status)) {
@@ -403,14 +518,22 @@ app.get('/', requireCustomer, (req, res) => {
       if (balance > 0) o.action_note = `Balance due: ${V.rm(balance)}`;
     }
   }
-  const credit = creditBalance(req.user.id);
   const body = `
   <div class="page-head">
-    <div><h1>My Orders</h1><p class="muted">Welcome back, ${V.esc(req.user.name)}.${credit > 0 ? ` You have <strong>${V.rm(credit)}</strong> store credit.` : ''}</p></div>
+    <div><h1>My Orders</h1><p class="muted">All your orders, newest first.</p></div>
     <a class="btn btn-primary" href="/orders/new">+ New Order</a>
   </div>
   ${V.ordersTable(orders)}`;
-  render(req, res, { title: 'My Orders', user: req.user, body, active: 'home' });
+  render(req, res, { title: 'My Orders', user: req.user, body, active: 'orders' });
+});
+
+// Banner images are visible to any signed-in user.
+app.get('/banners/:id/image', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login');
+  const b = db.prepare('SELECT * FROM banners WHERE id = ?').get(req.params.id);
+  if (!b || !b.image_stored) return res.status(404).send('Not found');
+  res.sendFile(path.join(UPLOAD_DIR, b.image_stored));
 });
 
 // ---------- customer: new order ----------
@@ -891,7 +1014,7 @@ app.get('/orders/:id', requireCustomer, (req, res) => {
       <button class="btn btn-danger" type="submit">Cancel This Order</button>
     </form>
   </div>` : ''}`;
-  render(req, res, { title: `Order ${order.order_no}`, user: req.user, body, active: 'home' });
+  render(req, res, { title: `Order ${order.order_no}`, user: req.user, body, active: 'orders' });
 });
 
 app.post('/orders/:id/artwork', requireCustomer, runUpload(uploadArtwork), (req, res) => {
@@ -2227,6 +2350,38 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
     </form>
   </div>
   <div class="card">
+    <h2>Homepage Banners</h2>
+    <p class="muted small">Shown to customers at the top of their homepage — promote products, announcements or promos. Multiple active banners rotate automatically.</p>
+    <form method="post" action="/admin/banners" enctype="multipart/form-data" class="stack">
+      <div class="grid-fields">
+        <label>Title <span class="req-chip">Required</span><input name="title" required maxlength="100" placeholder="e.g. New Retro Series now available!"></label>
+        <label>Link URL (optional — defaults to New Order)<input name="link_url" type="url" placeholder="https://..."></label>
+      </div>
+      <label>Text (optional)<input name="body" maxlength="200" placeholder="e.g. Fresh colours, same great prices. Order yours today."></label>
+      <label>Banner image (optional — jpg/png/webp, max 8MB)<input type="file" name="image" accept=".jpg,.jpeg,.png,.webp,.gif"></label>
+      <button class="btn btn-primary" type="submit">Add Banner</button>
+    </form>
+    ${(() => {
+      const banners = db.prepare('SELECT * FROM banners ORDER BY active DESC, id DESC').all();
+      if (!banners.length) return '';
+      return `<div class="table-wrap" style="margin-top:1rem"><table class="table">
+        <thead><tr><th>Title</th><th>Text</th><th>Image</th><th>Status</th><th></th></tr></thead>
+        <tbody>${banners.map((b) => `<tr class="${b.active ? '' : 'inactive'}">
+          <td data-label="Title"><strong>${V.esc(b.title)}</strong></td>
+          <td data-label="Text">${V.esc(b.body || '-')}</td>
+          <td data-label="Image">${b.image_stored ? `<a href="/banners/${b.id}/image" target="_blank">${V.esc(b.image_name)}</a>` : '-'}</td>
+          <td data-label="Status">${b.active ? '<span class="badge badge-confirmed">Live</span>' : '<span class="badge">Hidden</span>'}</td>
+          <td data-label="" class="row-actions">
+            <form method="post" action="/admin/banners/${b.id}/toggle" class="inline-form">
+              <button class="btn btn-ghost btn-sm" type="submit">${b.active ? 'Hide' : 'Show'}</button></form>
+            <form method="post" action="/admin/banners/${b.id}/delete" class="inline-form"
+              onsubmit="return confirm('Delete this banner?')">
+              <button class="btn btn-danger btn-sm" type="submit">Delete</button></form>
+          </td>
+        </tr>`).join('')}</tbody></table></div>`;
+    })()}
+  </div>
+  <div class="card">
     <h2>Promo Codes</h2>
     <p class="muted small">Give a customer a code instead of negotiating discounts. "% off order" discounts the whole order (same effect as reducing all product prices); "RM off order" takes a fixed amount off.</p>
     <form method="post" action="/admin/promos" class="stack">
@@ -2238,6 +2393,8 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
         <label>Expires (optional)<input name="expires" type="date" min="${klDatePlus(1)}"></label>
         <label>Max uses (0 = unlimited)<input name="max_uses" type="number" step="1" min="0" value="0"></label>
       </div>
+      <label class="check"><input type="checkbox" name="is_public" value="1">
+        Show on customer homepage (promotions section)</label>
       <button class="btn btn-primary" type="submit">Create Promo Code</button>
     </form>
     ${(() => {
@@ -2250,7 +2407,7 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
           <td data-label="Discount">${p.kind === 'percent' ? p.value + '% off order' : V.rm(p.value) + ' off order'}</td>
           <td data-label="Expires">${p.expires ? V.esc(fmtDay(p.expires)) : 'Never'}</td>
           <td data-label="Used" class="num">${p.used_count}${p.max_uses > 0 ? ' / ' + p.max_uses : ''}</td>
-          <td data-label="Status">${p.active ? '<span class="badge badge-confirmed">Active</span>' : '<span class="badge">Disabled</span>'}</td>
+          <td data-label="Status">${p.active ? '<span class="badge badge-confirmed">Active</span>' : '<span class="badge">Disabled</span>'}${p.is_public ? ' <span class="badge badge-completed">On homepage</span>' : ''}</td>
           <td data-label=""><form method="post" action="/admin/promos/${p.id}/toggle" class="inline-form">
             <button class="btn btn-ghost btn-sm" type="submit">${p.active ? 'Disable' : 'Enable'}</button></form></td>
         </tr>`).join('')}</tbody></table></div>`;
@@ -2276,6 +2433,42 @@ app.post('/admin/settings', requireAdmin, (req, res) => {
   res.redirect('/admin/customers');
 });
 
+app.post('/admin/banners', requireAdmin, runUpload(uploadBanner), (req, res) => {
+  const title = String(req.body.title || '').trim().slice(0, 100);
+  if (!title) {
+    if (req.file) fs.unlink(req.file.path, () => {});
+    flash(req, 'error', 'Banner title is required.');
+    return res.redirect('/admin/customers');
+  }
+  const link = String(req.body.link_url || '').trim().slice(0, 500);
+  db.prepare('INSERT INTO banners (title, body, link_url, image_stored, image_name) VALUES (?,?,?,?,?)').run(
+    title,
+    String(req.body.body || '').trim().slice(0, 200),
+    /^https?:\/\//i.test(link) ? link : '',
+    req.file ? req.file.filename : '',
+    req.file ? req.file.originalname : ''
+  );
+  flash(req, 'success', 'Banner added — it is live on the customer homepage.');
+  res.redirect('/admin/customers');
+});
+
+app.post('/admin/banners/:id/toggle', requireAdmin, (req, res) => {
+  const b = db.prepare('SELECT * FROM banners WHERE id = ?').get(req.params.id);
+  if (!b) return res.status(404).send('Not found');
+  db.prepare('UPDATE banners SET active = ? WHERE id = ?').run(b.active ? 0 : 1, b.id);
+  flash(req, 'success', `Banner ${b.active ? 'hidden' : 'shown'}.`);
+  res.redirect('/admin/customers');
+});
+
+app.post('/admin/banners/:id/delete', requireAdmin, (req, res) => {
+  const b = db.prepare('SELECT * FROM banners WHERE id = ?').get(req.params.id);
+  if (!b) return res.status(404).send('Not found');
+  db.prepare('DELETE FROM banners WHERE id = ?').run(b.id);
+  if (b.image_stored) fs.unlink(path.join(UPLOAD_DIR, b.image_stored), () => {});
+  flash(req, 'success', 'Banner deleted.');
+  res.redirect('/admin/customers');
+});
+
 app.post('/admin/promos', requireAdmin, (req, res) => {
   const code = String(req.body.code || '').trim().toUpperCase().slice(0, 30).replace(/[^A-Z0-9-]/g, '');
   const kind = req.body.kind === 'fixed' ? 'fixed' : 'percent';
@@ -2287,8 +2480,8 @@ app.post('/admin/promos', requireAdmin, (req, res) => {
     return res.redirect('/admin/customers');
   }
   try {
-    db.prepare('INSERT INTO promo_codes (code, kind, value, expires, max_uses) VALUES (?,?,?,?,?)')
-      .run(code, kind, value, expires, maxUses);
+    db.prepare('INSERT INTO promo_codes (code, kind, value, expires, max_uses, is_public) VALUES (?,?,?,?,?,?)')
+      .run(code, kind, value, expires, maxUses, req.body.is_public ? 1 : 0);
     flash(req, 'success', `Promo code ${code} created: ${kind === 'percent' ? value + '% off' : V.rm(value) + ' off'} the order.`);
   } catch (e) {
     flash(req, 'error', 'That promo code already exists.');
