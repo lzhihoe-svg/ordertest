@@ -337,6 +337,16 @@ tr.inactive, .product-row.inactive { opacity: 0.55; }
 .stat-label { font-size: 0.72rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
 .stat-link { text-decoration: none; color: inherit; display: flex; flex-direction: column; gap: 0.15rem; }
 
+/* Promotions: stacked cards on desktop, swipeable row on touch-size screens. */
+@media (max-width: 1024px) {
+  .promo-scroll { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; gap: 0.7rem;
+    -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; scrollbar-width: none;
+    margin: 0 -0.2rem; padding: 0.2rem; }
+  .promo-scroll::-webkit-scrollbar { display: none; }
+  .promo-scroll .promo-card:only-child { flex-basis: 100%; }
+  .promo-scroll .promo-card { flex: 0 0 82%; scroll-snap-align: start; margin-bottom: 0; }
+}
+
 .search-form { display: flex; gap: 0.55rem; margin-bottom: 1.05rem; flex-wrap: wrap; }
 .search-form input { max-width: 340px; }
 
@@ -541,10 +551,16 @@ tr.inactive, .product-row.inactive { opacity: 0.55; }
   color: #fff;
   box-shadow: 0 2px 4px rgba(63, 98, 18, 0.15), 0 16px 40px -16px rgba(63, 98, 18, 0.55);
 }
-.hero-slide { display: none; align-items: center; gap: 1.5rem; padding: 2.1rem 2.4rem; min-height: 190px; }
-.hero-slide.active { display: flex; animation: heroIn 0.45s var(--ease) both; }
-@keyframes heroIn { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; transform: none; } }
-@media (prefers-reduced-motion: reduce) { .hero-slide.active { animation: none; } }
+.hero-track {
+  display: flex; overflow-x: auto; scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+.hero-track::-webkit-scrollbar { display: none; }
+.hero-slide {
+  flex: 0 0 100%; min-width: 100%; scroll-snap-align: start; scroll-snap-stop: always;
+  display: flex; align-items: center; gap: 1.5rem; padding: 2.1rem 2.4rem; min-height: 190px;
+}
 .hero-text { flex: 1 1 320px; min-width: 0; }
 .hero-title { color: #fff; font-size: 1.55rem; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 0.4rem; line-height: 1.22; }
 .hero-body { margin: 0 0 1.1rem; color: #eefcce; font-size: 0.98rem; max-width: 46ch; }

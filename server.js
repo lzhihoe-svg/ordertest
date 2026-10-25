@@ -435,8 +435,9 @@ app.get('/', requireCustomer, (req, res) => {
 
   const hero = banners.length
     ? `<div class="hero" id="hero">
-        ${banners.map((b, i) => `
-        <div class="hero-slide ${i === 0 ? 'active' : ''}">
+        <div class="hero-track" id="hero-track">
+        ${banners.map((b) => `
+        <div class="hero-slide">
           <div class="hero-text">
             <h2 class="hero-title">${V.esc(b.title)}</h2>
             ${b.body ? `<p class="hero-body">${V.esc(b.body)}</p>` : ''}
@@ -444,13 +445,14 @@ app.get('/', requireCustomer, (req, res) => {
           </div>
           ${b.image_stored ? `<div class="hero-img"><img src="/banners/${b.id}/image" alt="${V.esc(b.title)}"></div>` : ''}
         </div>`).join('')}
+        </div>
         ${banners.length > 1 ? `<div class="hero-dots">${banners.map((b, i) => `<button class="hero-dot ${i === 0 ? 'active' : ''}" data-i="${i}" aria-label="Banner ${i + 1}"></button>`).join('')}</div>` : ''}
       </div>`
-    : `<div class="hero"><div class="hero-slide active"><div class="hero-text">
+    : `<div class="hero"><div class="hero-track"><div class="hero-slide"><div class="hero-text">
         <h2 class="hero-title">Welcome back, ${V.esc(req.user.name)}</h2>
         <p class="hero-body">Custom apparel printing at your own prices — order in minutes, invoice generated instantly.</p>
         <a class="btn hero-btn" href="/orders/new">Order Now</a>
-      </div></div></div>`;
+      </div></div></div></div>`;
 
   const body = `
   ${hero}
@@ -470,12 +472,12 @@ app.get('/', requireCustomer, (req, res) => {
     </div>
     <div class="card">
       <h2>Current Promotions</h2>
-      ${promos.length ? promos.map((p) => `
+      ${promos.length ? `<div class="promo-scroll">${promos.map((p) => `
       <div class="promo-card">
         <div><code class="promo-code">${V.esc(p.code)}</code>
           <span class="promo-desc">${p.kind === 'percent' ? p.value + '% off your entire order' : V.rm(p.value) + ' off your entire order'}</span></div>
         <span class="muted small">${p.expires ? 'Until ' + V.esc(fmtDay(p.expires)) : 'Limited time'} &middot; enter at checkout</span>
-      </div>`).join('') : '<p class="muted">No promotions right now — check back soon.</p>'}
+      </div>`).join('')}</div>` : '<p class="muted">No promotions right now — check back soon.</p>'}
     </div>
   </div>
   <div class="page-head" style="margin-top:0.4rem">
@@ -488,17 +490,24 @@ app.get('/', requireCustomer, (req, res) => {
   ${V.ordersTable(orders.slice(0, 5))}
   ${banners.length > 1 ? `<script>
     (function () {
-      const slides = document.querySelectorAll('.hero-slide');
+      const track = document.getElementById('hero-track');
       const dots = document.querySelectorAll('.hero-dot');
+      const n = track.children.length;
       let i = 0, timer;
-      function show(n) {
-        i = n % slides.length;
-        slides.forEach((s, x) => s.classList.toggle('active', x === i));
-        dots.forEach((d, x) => d.classList.toggle('active', x === i));
+      function markDots() { dots.forEach((d, x) => d.classList.toggle('active', x === i)); }
+      function goTo(x) {
+        i = ((x % n) + n) % n;
+        track.scrollTo({ left: i * track.clientWidth, behavior: 'smooth' });
+        markDots();
       }
-      function auto() { timer = setInterval(() => show(i + 1), 5000); }
-      dots.forEach((d) => d.addEventListener('click', () => { clearInterval(timer); show(+d.dataset.i); auto(); }));
-      auto();
+      function restart() { clearInterval(timer); timer = setInterval(() => goTo(i + 1), 5000); }
+      // Swipes land here: track the snapped slide and reset the auto-advance clock.
+      track.addEventListener('scroll', () => {
+        const x = Math.round(track.scrollLeft / track.clientWidth);
+        if (x !== i) { i = x; markDots(); restart(); }
+      }, { passive: true });
+      dots.forEach((d) => d.addEventListener('click', () => goTo(+d.dataset.i)));
+      restart();
     })();
   </script>` : ''}`;
   render(req, res, { title: 'Home', user: req.user, body, active: 'home' });
