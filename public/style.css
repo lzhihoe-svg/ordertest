@@ -117,8 +117,11 @@ code {
   box-shadow: var(--shadow-card);
   margin-bottom: 1.2rem;
 }
-.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; align-items: start; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; align-items: stretch; }
 .grid-2 .card { margin-bottom: 1.2rem; }
+/* Password dots in a dedicated glyph-safe font: Figtree lacks the mask bullet on some devices. */
+input[type="password"] { font-family: Verdana, ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.08em; }
+input[type="password"]::placeholder { font-family: 'Figtree', ui-sans-serif, system-ui, sans-serif; letter-spacing: normal; }
 .stack { display: flex; flex-direction: column; gap: 0.95rem; }
 .grid-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0.85rem; }
 .section-title { margin: 1.7rem 0 0.9rem; }
