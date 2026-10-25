@@ -471,7 +471,7 @@ app.get('/', requireCustomer, (req, res) => {
         : '<p class="muted">Nothing pending — you are all caught up.</p>'}
     </div>
     <div class="card">
-      <h2>Current Promotions</h2>
+      <h2>Your Promotions</h2>
       ${promos.length ? `<div class="promo-scroll">${promos.map((p) => `
       <div class="promo-card">
         <div><code class="promo-code">${V.esc(p.code)}</code>
