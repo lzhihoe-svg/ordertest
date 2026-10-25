@@ -179,7 +179,11 @@ const uploadBanner = multer({
     if (/\.(jpe?g|png|webp|gif)$/i.test(file.originalname)) return cb(null, true);
     cb(new Error('Banner image must be jpg, png, webp or gif (max 8MB).'));
   },
-}).single('image');
+}).fields([
+  { name: 'image_desktop', maxCount: 1 },
+  { name: 'image_tablet', maxCount: 1 },
+  { name: 'image_mobile', maxCount: 1 },
+]);
 
 const uploadTemplate = multer({
   storage,
@@ -360,6 +364,9 @@ app.get('/account', requireCustomer, (req, res) => {
     </div>
     <div class="card">
       <h2>My Price List</h2>
+      ${req.user.base_price != null && req.user.base_price > 0
+        ? `<p class="small">Your base price: <strong>${V.rm(req.user.base_price)}</strong> <span class="muted">(Roundneck Short Sleeve — other products are priced relative to it)</span></p>`
+        : ''}
       <p class="muted small">Your prices for each product. Bulk discounts (where set) apply automatically by quantity.</p>
       <div class="table-wrap pricelist-wrap"><table class="table">
         <thead><tr><th>Product</th><th class="num">Your Price</th></tr></thead>
@@ -422,10 +429,6 @@ app.get('/', requireCustomer, (req, res) => {
     }
     if (o.status === 'needs_revision') attention.push({ o, note: 'Revision requested — fix and resubmit' });
   }
-  const activeQuotes = db
-    .prepare("SELECT COUNT(*) AS n FROM quotes WHERE customer_id = ? AND status = 'quoted' AND valid_until >= ?")
-    .get(req.user.id, klDatePlus(0)).n;
-
   const banners = db.prepare('SELECT * FROM banners WHERE active = 1 ORDER BY id DESC').all();
   const promos = db
     .prepare(`SELECT * FROM promo_codes WHERE active = 1 AND is_public = 1
@@ -436,17 +439,26 @@ app.get('/', requireCustomer, (req, res) => {
   const hero = banners.length
     ? `<div class="hero" id="hero">
         <div class="hero-track" id="hero-track">
-        ${banners.map((b) => `
+        ${banners.map((b) => {
+          const hasImg = b.image_stored || b.image_stored_tablet || b.image_stored_mobile;
+          return `
         <div class="hero-slide">
           <div class="hero-text">
             <h2 class="hero-title">${V.esc(b.title)}</h2>
             ${b.body ? `<p class="hero-body">${V.esc(b.body)}</p>` : ''}
-            <a class="btn hero-btn" href="${b.link_url ? V.esc(b.link_url) : '/orders/new'}">${b.link_url ? 'Learn More' : 'Order Now'}</a>
+            <a class="btn hero-btn" href="${b.link_url ? V.esc(b.link_url) : '/orders/new'}">${V.esc(b.button_label || (b.link_url ? 'Learn More' : 'Order Now'))}</a>
           </div>
-          ${b.image_stored ? `<div class="hero-img"><img src="/banners/${b.id}/image" alt="${V.esc(b.title)}"></div>` : ''}
-        </div>`).join('')}
+          ${hasImg ? `<div class="hero-img"><picture>
+            ${b.image_stored_mobile ? `<source media="(max-width: 680px)" srcset="/banners/${b.id}/image?size=mobile">` : ''}
+            ${b.image_stored_tablet ? `<source media="(max-width: 1024px)" srcset="/banners/${b.id}/image?size=tablet">` : ''}
+            <img src="/banners/${b.id}/image" alt="${V.esc(b.title)}">
+          </picture></div>` : ''}
+        </div>`; }).join('')}
         </div>
-        ${banners.length > 1 ? `<div class="hero-dots">${banners.map((b, i) => `<button class="hero-dot ${i === 0 ? 'active' : ''}" data-i="${i}" aria-label="Banner ${i + 1}"></button>`).join('')}</div>` : ''}
+        ${banners.length > 1 ? `
+        <button type="button" class="hero-arrow hero-prev" data-step="-1" aria-label="Previous banner">&#10094;</button>
+        <button type="button" class="hero-arrow hero-next" data-step="1" aria-label="Next banner">&#10095;</button>
+        <div class="hero-dots">${banners.map((b, i) => `<button class="hero-dot ${i === 0 ? 'active' : ''}" data-i="${i}" aria-label="Banner ${i + 1}"></button>`).join('')}</div>` : ''}
       </div>`
     : `<div class="hero"><div class="hero-track"><div class="hero-slide"><div class="hero-text">
         <h2 class="hero-title">Welcome back, ${V.esc(req.user.name)}</h2>
@@ -457,10 +469,10 @@ app.get('/', requireCustomer, (req, res) => {
   const body = `
   ${hero}
   <div class="stat-row">
-    <a href="/account" class="stat-card stat-link"><span class="stat-num">${V.rm(credit)}</span><span class="stat-label">Wallet / Store Credit</span></a>
     <a href="/orders" class="stat-card stat-link"><span class="stat-num">${inProgress}</span><span class="stat-label">Orders In Progress</span></a>
+    <a href="/orders" class="stat-card stat-link"><span class="stat-num">${orders.length}</span><span class="stat-label">Total Orders Submitted</span></a>
     <a href="/orders" class="stat-card stat-link"><span class="stat-num">${V.rm(balanceDue)}</span><span class="stat-label">Balance Due</span></a>
-    <a href="/quotes" class="stat-card stat-link"><span class="stat-num">${activeQuotes}</span><span class="stat-label">Active Quotations</span></a>
+    <a href="/account" class="stat-card stat-link"><span class="stat-num">${V.rm(credit)}</span><span class="stat-label">Wallet / Store Credit</span></a>
   </div>
   <div class="grid-2">
     <div class="card">
@@ -507,6 +519,7 @@ app.get('/', requireCustomer, (req, res) => {
         if (x !== i) { i = x; markDots(); restart(); }
       }, { passive: true });
       dots.forEach((d) => d.addEventListener('click', () => goTo(+d.dataset.i)));
+      document.querySelectorAll('.hero-arrow').forEach((a) => a.addEventListener('click', () => goTo(i + (+a.dataset.step))));
       restart();
     })();
   </script>` : ''}`;
@@ -517,9 +530,20 @@ app.get('/', requireCustomer, (req, res) => {
 
 app.get('/orders', requireCustomer, (req, res) => {
   sweepUnpaidOrders();
-  const orders = db
+  const all = db
     .prepare('SELECT * FROM orders WHERE customer_id = ? ORDER BY id DESC')
     .all(req.user.id);
+  const FILTERS = [
+    ['all', 'All'],
+    ['submitted', 'Submitted'],
+    ['needs_revision', 'Revision'],
+    ['confirmed', 'Confirmed'],
+    ['completed', 'Complete'],
+    ['delivered', 'Delivered'],
+    ['cancelled', 'Cancelled'],
+  ];
+  const sel = FILTERS.some(([k]) => k === req.query.status) ? req.query.status : 'all';
+  const orders = sel === 'all' ? all : all.filter((o) => o.status === sel);
   for (const o of orders) {
     if (o.status === 'needs_revision') o.action_note = 'Action needed: revise and resubmit';
     else if (['submitted', 'confirmed', 'completed'].includes(o.status)) {
@@ -527,13 +551,47 @@ app.get('/orders', requireCustomer, (req, res) => {
       if (balance > 0) o.action_note = `Balance due: ${V.rm(balance)}`;
     }
   }
+  const chips = FILTERS.map(([k, label]) => {
+    const n = k === 'all' ? all.length : all.filter((o) => o.status === k).length;
+    if (k !== 'all' && n === 0) return '';
+    return `<a class="chip ${sel === k ? 'active' : ''}" href="/orders${k === 'all' ? '' : '?status=' + k}">${label} <span class="chip-n">${n}</span></a>`;
+  }).join('');
   const body = `
   <div class="page-head">
     <div><h1>My Orders</h1><p class="muted">All your orders, newest first.</p></div>
     <a class="btn btn-primary" href="/orders/new">+ New Order</a>
   </div>
-  ${V.ordersTable(orders)}`;
+  <div class="chip-row">${chips}</div>
+  ${orders.length ? V.ordersTable(orders) : `<div class="empty">No ${sel === 'all' ? '' : 'matching '}orders${sel === 'all' ? ' yet' : ''}.</div>`}`;
   render(req, res, { title: 'My Orders', user: req.user, body, active: 'orders' });
+});
+
+// ---------- customer: my invoices (for the customer's own accounting) ----------
+
+app.get('/invoices', requireCustomer, (req, res) => {
+  const orders = db
+    .prepare(`SELECT o.*, (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) AS item_count
+              FROM orders o WHERE o.customer_id = ? ORDER BY o.id DESC`)
+    .all(req.user.id);
+  const rows = orders.map((o) => `<tr class="${o.status === 'cancelled' ? 'inv-void' : ''}">
+    <td data-label="Invoice #"><a href="/orders/${o.id}/invoice" target="_blank"><strong>${V.esc(o.invoice_no)}</strong></a></td>
+    <td data-label="Order #"><a href="/orders/${o.id}">${V.esc(o.order_no)}</a><div class="muted small">${V.esc(o.job_name || '')}</div></td>
+    <td data-label="Order Date">${V.esc(V.fmtDate(o.created_at))}</td>
+    <td data-label="Items" class="num">${o.item_count}</td>
+    <td data-label="Total" class="num">${V.rm(o.total)}</td>
+    <td data-label="Status">${o.status === 'cancelled' ? '<span class="badge badge-cancelled">Cancelled</span>' : V.statusBadge(o.status)}</td>
+    <td data-label=""><a class="btn btn-sm btn-primary" href="/orders/${o.id}/invoice?download=1" target="_blank">Download Invoice</a></td>
+  </tr>`).join('');
+  const body = `
+  <div class="page-head">
+    <div><h1>My Invoices</h1>
+    <p class="muted">Every invoice in one place for your own accounting — click Download Invoice to save the PDF instantly.</p></div>
+  </div>
+  ${orders.length ? `<div class="table-wrap"><table class="table">
+    <thead><tr><th>Invoice #</th><th>Order #</th><th>Order Date</th><th class="num">No. of Items</th><th class="num">Total</th><th>Status</th><th></th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>` : '<div class="empty">No invoices yet. Invoices are generated automatically when you place an order.</div>'}`;
+  render(req, res, { title: 'My Invoices', user: req.user, body, active: 'invoices' });
 });
 
 // Banner images are visible to any signed-in user.
@@ -541,8 +599,11 @@ app.get('/banners/:id/image', (req, res) => {
   const user = currentUser(req);
   if (!user) return res.redirect('/login');
   const b = db.prepare('SELECT * FROM banners WHERE id = ?').get(req.params.id);
-  if (!b || !b.image_stored) return res.status(404).send('Not found');
-  res.sendFile(path.join(UPLOAD_DIR, b.image_stored));
+  if (!b) return res.status(404).send('Not found');
+  const bySize = { desktop: b.image_stored, tablet: b.image_stored_tablet, mobile: b.image_stored_mobile };
+  const stored = bySize[req.query.size] || b.image_stored || b.image_stored_tablet || b.image_stored_mobile;
+  if (!stored) return res.status(404).send('Not found');
+  res.sendFile(path.join(UPLOAD_DIR, stored));
 });
 
 // ---------- customer: new order ----------
@@ -552,7 +613,7 @@ app.get('/orders/new', requireCustomer, (req, res) => {
   const leadDays = parseInt(setting('lead_days', '3'), 10);
   const minDate = klDatePlus(leadDays);
   const expressPct = parseFloat(setting('express_percent', '20')) || 0;
-  const expressDays = parseInt(setting('express_lead_days', '1'), 10);
+  const expressDays = parseInt(setting('express_lead_days', '2'), 10);
   const expressMin = klDatePlus(expressDays);
   const expressAvailable = expressPct > 0 && expressDays < leadDays;
   const credit = creditBalance(req.user.id);
@@ -786,7 +847,7 @@ app.post('/orders', requireCustomer, runUpload(uploadArtwork), (req, res) => {
   // Rush order: shorter lead time, surcharge applied — only when enabled in settings.
   const leadDays = parseInt(setting('lead_days', '3'), 10);
   const expressPct = parseFloat(setting('express_percent', '20')) || 0;
-  const expressDays = parseInt(setting('express_lead_days', '1'), 10);
+  const expressDays = parseInt(setting('express_lead_days', '2'), 10);
   const isExpress = !!req.body.is_express && expressPct > 0 && expressDays < leadDays;
 
   // Rule: needed-by date is required and must respect the (rush or normal) lead time.
@@ -1167,7 +1228,7 @@ function quotesTable(quotes, admin) {
       .map(
         (q) => `<tr>
       <td data-label="Quote #"><a href="${base}${q.id}"><strong>${V.esc(q.quote_no)}</strong></a>
-        <div class="muted small">${V.esc(q.title)}</div></td>
+        <div class="muted small">${V.esc(q.job_name || q.title)}</div></td>
       ${admin ? `<td data-label="Customer">${V.esc(q.customer_company || q.customer_name)}</td>` : ''}
       <td data-label="Date">${V.esc(V.fmtDate(q.created_at))}</td>
       <td data-label="Valid Until">${V.esc(fmtDay(q.valid_until))}</td>
@@ -1241,9 +1302,14 @@ app.get('/quotes', requireCustomer, (req, res) => {
           <td class="num"><strong id="q-total">RM 0.00</strong></td></tr>
         </tfoot>
       </table></div>
-      <label style="margin-top:0.9rem">Notes on the quotation (optional)
-        <input name="notes" maxlength="300" placeholder="e.g. for Q1 event budget approval">
-      </label>
+      <div class="grid-fields" style="margin-top:0.9rem">
+        <label>Job name (optional — carried into the order when you convert)
+          <input name="job_name" maxlength="100" placeholder="e.g. Company Family Day Tees 2026">
+        </label>
+        <label>Notes on the quotation (optional)
+          <input name="notes" maxlength="300" placeholder="e.g. for Q1 event budget approval">
+        </label>
+      </div>
       <button class="btn btn-primary btn-lg" type="submit" style="margin-top:0.9rem">Generate Quotation</button>
     </form>
   </div>
@@ -1324,11 +1390,12 @@ app.post('/quotes', requireCustomer, (req, res) => {
   const quoteId = db.transaction(() => {
     const info = db
       .prepare(
-        `INSERT INTO quotes (quote_no, customer_id, title, notes, status, subtotal, sst_percent, sst_amount, total, valid_until)
-         VALUES (?,?,?,?,'quoted',?,?,?,?,?)`
+        `INSERT INTO quotes (quote_no, customer_id, title, job_name, notes, status, subtotal, sst_percent, sst_amount, total, valid_until)
+         VALUES (?,?,?,?,?,'quoted',?,?,?,?,?)`
       )
       .run(
         nextQuoteNo(), req.user.id, title,
+        String(req.body.job_name || '').trim().slice(0, 100),
         String(req.body.notes || '').trim().slice(0, 300),
         subtotal, sstPercent, sstAmount, total, klDatePlus(validDays)
       );
@@ -1352,7 +1419,7 @@ app.get('/quotes/:id', requireCustomer, (req, res) => {
   const minDate = klDatePlus(leadDays);
   const body = `
   <div class="page-head">
-    <div><h1>Quotation ${V.esc(q.quote_no)}</h1><p class="muted">${V.esc(q.title)} &middot; ${V.esc(V.fmtDate(q.created_at))}</p></div>
+    <div><h1>Quotation ${V.esc(q.quote_no)}</h1><p class="muted">${q.job_name ? `<strong>${V.esc(q.job_name)}</strong> &middot; ` : ''}${V.esc(q.title)} &middot; ${V.esc(V.fmtDate(q.created_at))}</p></div>
     <div class="head-actions">${qBadge(q)}
       <a class="btn btn-primary" href="/quotes/${q.id}/doc" target="_blank">View / Print Quotation</a>
       ${q.order_id ? `<a class="btn btn-outline" href="/orders/${q.order_id}">View Order</a>` : ''}</div>
@@ -1370,7 +1437,7 @@ app.get('/quotes/:id', requireCustomer, (req, res) => {
     <p class="muted small">This places a real order at the quoted prices and generates the invoice. Artwork is required, same as a normal order.</p>
     <form method="post" action="/quotes/${q.id}/accept" enctype="multipart/form-data" class="stack">
       <label>Job name <span class="req-chip">Required</span>
-        <input name="job_name" required maxlength="100" placeholder="e.g. Company Family Day Tees 2026">
+        <input name="job_name" required maxlength="100" value="${V.esc(q.job_name || '')}" placeholder="e.g. Company Family Day Tees 2026">
       </label>
       <label>Artwork zip file (max 500MB)
         <input type="file" name="artwork" accept=".zip">
@@ -1414,7 +1481,7 @@ app.get(['/quotes/:id/doc', '/admin/quotes/:id/doc'], (req, res) => {
   if (user.role !== 'admin' && q.customer_id !== user.id) return res.status(404).send('Quote not found');
   const items = getQuoteItems(q.id);
   const customerLabel = q.customer_company || q.customer_name;
-  const pdfName = `${q.quote_no} - ${customerLabel} - ${V.rm(q.total).replace('RM ', 'RM')}`;
+  const pdfName = `${q.quote_no} - ${q.job_name || customerLabel}`;
   res.send(`<!doctype html>
 <html lang="en">
 <head>
@@ -1422,11 +1489,13 @@ app.get(['/quotes/:id/doc', '/admin/quotes/:id/doc'], (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${V.esc(pdfName)}</title>
 <link rel="stylesheet" href="/style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 </head>
 <body class="invoice-body">
 <div class="invoice-actions no-print">
   <a class="btn btn-ghost" href="${user.role === 'admin' ? `/admin/quotes/${q.id}` : `/quotes/${q.id}`}">&larr; Back to Quotation</a>
-  <button class="btn btn-primary" onclick="window.print()">Download PDF / Print</button>
+  <button class="btn btn-primary" onclick="downloadPDF()">Download PDF</button>
+  <button class="btn btn-outline" onclick="window.print()">Print</button>
 </div>
 <div class="invoice-sheet">
   <header class="inv-head">
@@ -1438,6 +1507,7 @@ app.get(['/quotes/:id/doc', '/admin/quotes/:id/doc'], (req, res) => {
       <h1>QUOTATION</h1>
       <table class="inv-meta">
         <tr><td>Quotation No</td><td><strong>${V.esc(q.quote_no)}</strong></td></tr>
+        ${q.job_name ? `<tr><td>Job</td><td>${V.esc(q.job_name)}</td></tr>` : ''}
         <tr><td>Date</td><td>${V.esc(V.fmtDate(q.created_at))}</td></tr>
         <tr><td>Valid Until</td><td><strong>${V.esc(fmtDay(q.valid_until))}</strong></td></tr>
       </table>
@@ -1472,6 +1542,21 @@ app.get(['/quotes/:id/doc', '/admin/quotes/:id/doc'], (req, res) => {
     <p style="margin-top:0.5rem">Bank Name: CIMB<br>Beneficiary Name: Aramega Textile Sdn Bhd<br>Account Number: 8605494198</p>
   </section>
 </div>
+<script>
+  function downloadPDF() {
+    if (typeof html2pdf === 'undefined') { window.print(); return; }
+    html2pdf().set({
+      margin: [8, 8, 10, 8],
+      filename: ${JSON.stringify(pdfName)} + '.pdf',
+      image: { type: 'jpeg', quality: 0.96 },
+      html2canvas: { scale: 2, useCORS: true },
+      jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+    }).from(document.querySelector('.invoice-sheet')).save();
+  }
+  if (new URLSearchParams(location.search).get('download') === '1') {
+    window.addEventListener('load', () => setTimeout(downloadPDF, 300));
+  }
+</script>
 </body>
 </html>`);
 });
@@ -1615,7 +1700,8 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
   const paid = paidFor(order);
   const balance = round2(order.total - paid);
   const customerLabel = order.customer_company || order.customer_name;
-  const pdfName = `${order.invoice_no} - ${customerLabel} - ${V.rm(order.total).replace('RM ', 'RM')}`;
+  const pdfName = `${order.invoice_no} - ${order.job_name || customerLabel}`;
+  const isPaid = balance <= 0 && paid > 0;
   res.send(`<!doctype html>
 <html lang="en">
 <head>
@@ -1623,13 +1709,17 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${V.esc(pdfName)}</title>
 <link rel="stylesheet" href="/style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 </head>
 <body class="invoice-body">
 <div class="invoice-actions no-print">
   <a class="btn btn-ghost" href="${user.role === 'admin' ? `/admin/orders/${order.id}` : `/orders/${order.id}`}">&larr; Back to Order</a>
-  <button class="btn btn-primary" onclick="window.print()">Download PDF / Print</button>
+  <button class="btn btn-primary" onclick="downloadPDF()">Download PDF</button>
+  <button class="btn btn-outline" onclick="window.print()">Print</button>
 </div>
 <div class="invoice-sheet">
+  ${isPaid ? `<div class="paid-strip">PAID &mdash; payment received in full</div>
+  <div class="paid-stamp" aria-hidden="true"><span>PAID</span></div>` : ''}
   <header class="inv-head">
     <div>
       <div class="inv-brand"><span class="brand-mark">A</span> Aramega Textile Sdn Bhd</div>
@@ -1684,6 +1774,21 @@ app.get(['/orders/:id/invoice', '/admin/orders/:id/invoice'], (req, res) => {
     <p class="muted small">Full payment is required before production starts, and must be verified within 3 hours of order submission or the order is cancelled automatically. Please upload your bank receipt on the order page after making payment.</p>
   </section>
 </div>
+<script>
+  function downloadPDF() {
+    if (typeof html2pdf === 'undefined') { window.print(); return; }
+    html2pdf().set({
+      margin: [8, 8, 10, 8],
+      filename: ${JSON.stringify(pdfName)} + '.pdf',
+      image: { type: 'jpeg', quality: 0.96 },
+      html2canvas: { scale: 2, useCORS: true },
+      jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+    }).from(document.querySelector('.invoice-sheet')).save();
+  }
+  if (new URLSearchParams(location.search).get('download') === '1') {
+    window.addEventListener('load', () => setTimeout(downloadPDF, 300));
+  }
+</script>
 </body>
 </html>`);
 });
@@ -2181,7 +2286,10 @@ app.get('/admin/products', requireAdmin, (req, res) => {
       <div class="grid-fields">
         <label>Name<input name="name" value="${V.esc(p.name)}" required></label>
         <label>Unit<input name="unit" value="${V.esc(p.unit)}" required></label>
-        <label>Base Price (RM)<input name="base_price" type="number" step="0.01" min="0" value="${p.base_price}" required></label>
+        <label>+/- vs customer base price (RM) <span class="muted small">(e.g. 3 or -2; blank if fixed)</span>
+          <input name="price_offset" type="number" step="0.01" value="${p.fixed_price != null ? '' : (p.price_offset != null ? p.price_offset : '')}"></label>
+        <label>Fixed price (RM) <span class="muted small">(same for every customer; overrides +/-)</span>
+          <input name="fixed_price" type="number" step="0.01" min="0" value="${p.fixed_price != null ? p.fixed_price : ''}"></label>
         <label>Min Order Qty<input name="moq" type="number" step="1" min="1" value="${p.moq}" required></label>
       </div>
       <label>Description<input name="description" value="${V.esc(p.description)}"></label>
@@ -2199,14 +2307,18 @@ app.get('/admin/products', requireAdmin, (req, res) => {
     )
     .join('');
   const body = `
-  <div class="page-head"><div><h1>Products</h1><p class="muted">Base prices apply unless a bulk tier or a customer-specific price applies. A customer-specific price always wins.</p></div></div>
+  <div class="page-head"><div><h1>Products</h1>
+  <p class="muted">Each customer has a <strong>base price</strong> (their Roundneck Short Sleeve price, set on the Customers page).
+  A product's price = customer base price <strong>+/- the offset</strong> below, or a <strong>fixed price</strong> that is the same for everyone.
+  A customer-specific override (Set Pricing) always wins over both.</p></div></div>
   <div class="card">
     <h2>Add Product</h2>
     <form method="post" action="/admin/products" enctype="multipart/form-data" class="stack">
       <div class="grid-fields">
         <label>Name<input name="name" required></label>
         <label>Unit<input name="unit" value="pcs" required></label>
-        <label>Base Price (RM)<input name="base_price" type="number" step="0.01" min="0" required></label>
+        <label>+/- vs customer base price (RM)<input name="price_offset" type="number" step="0.01" placeholder="e.g. 3 or -2"></label>
+        <label>Fixed price (RM, optional)<input name="fixed_price" type="number" step="0.01" min="0" placeholder="overrides +/-"></label>
         <label>Min Order Qty<input name="moq" type="number" step="1" min="1" value="1" required></label>
       </div>
       <label>Description<input name="description"></label>
@@ -2223,12 +2335,17 @@ app.get('/admin/products', requireAdmin, (req, res) => {
 });
 
 function productFieldsValid(req) {
-  const price = parseFloat(req.body.base_price);
   const moq = parseInt(req.body.moq, 10);
-  if (!req.body.name || isNaN(price) || price < 0 || isNaN(moq) || moq < 1) return null;
+  if (!req.body.name || isNaN(moq) || moq < 1) return null;
+  const rawOffset = String(req.body.price_offset ?? '').trim();
+  const rawFixed = String(req.body.fixed_price ?? '').trim();
+  const offset = rawOffset === '' ? null : parseFloat(rawOffset);
+  const fixed = rawFixed === '' ? null : parseFloat(rawFixed);
+  if (offset !== null && isNaN(offset)) return null;
+  if (fixed !== null && (isNaN(fixed) || fixed < 0)) return null;
   const tiers = parseTiers(req.body.tiers);
   if (tiers === null) return null;
-  return { price, moq, tiers };
+  return { offset, fixed, moq, tiers };
 }
 
 app.post('/admin/products', requireAdmin, runUpload(uploadTemplate), (req, res) => {
@@ -2239,12 +2356,12 @@ app.post('/admin/products', requireAdmin, runUpload(uploadTemplate), (req, res) 
     return res.redirect('/admin/products');
   }
   const info = db.prepare(
-    'INSERT INTO products (name, description, unit, base_price, moq, artwork_spec, template_stored, template_name) VALUES (?,?,?,?,?,?,?,?)'
+    'INSERT INTO products (name, description, unit, base_price, price_offset, fixed_price, moq, artwork_spec, template_stored, template_name) VALUES (?,?,?,0,?,?,?,?,?,?)'
   ).run(
     String(req.body.name).trim().slice(0, 200),
     String(req.body.description || '').trim().slice(0, 500),
     String(req.body.unit || 'pcs').trim().slice(0, 30),
-    v.price, v.moq,
+    v.offset, v.fixed, v.moq,
     String(req.body.artwork_spec || '').trim().slice(0, 300),
     req.file ? req.file.filename : '',
     req.file ? req.file.originalname : ''
@@ -2267,11 +2384,11 @@ app.post('/admin/products/:id', requireAdmin, runUpload(uploadTemplate), (req, r
       flash(req, 'error', 'Check the product fields: name, valid price, min order qty of at least 1, and tiers in the form 50=22.50, 100=19.90.');
       return res.redirect('/admin/products');
     }
-    db.prepare('UPDATE products SET name = ?, description = ?, unit = ?, base_price = ?, moq = ?, artwork_spec = ? WHERE id = ?').run(
+    db.prepare('UPDATE products SET name = ?, description = ?, unit = ?, price_offset = ?, fixed_price = ?, moq = ?, artwork_spec = ? WHERE id = ?').run(
       String(req.body.name).trim().slice(0, 200),
       String(req.body.description || '').trim().slice(0, 500),
       String(req.body.unit || 'pcs').trim().slice(0, 30),
-      v.price, v.moq,
+      v.offset, v.fixed, v.moq,
       String(req.body.artwork_spec || '').trim().slice(0, 300),
       p.id
     );
@@ -2297,6 +2414,12 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
       <td data-label="Name"><strong>${V.esc(c.name)}</strong><div class="muted small">${V.esc(c.company)}</div></td>
       <td data-label="Username"><code>${V.esc(c.username)}</code></td>
       <td data-label="Phone">${V.esc(c.phone || '-')}</td>
+      <td data-label="Base Price" class="num">
+        <form method="post" action="/admin/customers/${c.id}/baseprice" class="inline-form baseprice-form">
+          <input name="base_price" type="number" step="0.01" min="0" value="${c.base_price != null ? c.base_price : ''}" placeholder="not set">
+          <button class="btn btn-outline btn-sm" type="submit">Save</button>
+        </form>
+      </td>
       <td data-label="Credit" class="num">${credit > 0 ? `<strong>${V.rm(credit)}</strong>` : '-'}</td>
       <td data-label="Status">${c.active ? '<span class="badge badge-confirmed">Active</span>' : '<span class="badge">Disabled</span>'}</td>
       <td data-label="Actions" class="row-actions">
@@ -2318,7 +2441,9 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
     .join('');
   const body = `
   <div class="page-head"><div><h1>Customers &amp; Pricing</h1>
-  <p class="muted">Create customer logins (give them the username &amp; password), and set each customer's prices.</p></div></div>
+  <p class="muted">Create customer logins (give them the username &amp; password), and set each customer's <strong>base price</strong> —
+  their Roundneck Short Sleeve price. Every other product follows automatically (+/- per product, set on the Products page).
+  Use Set Pricing for one-off overrides on specific products.</p></div></div>
   <div class="card">
     <h2>Add Customer</h2>
     <form method="post" action="/admin/customers" class="stack">
@@ -2330,13 +2455,15 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
       <div class="grid-fields">
         <label>Username<input name="username" required autocomplete="off"></label>
         <label>Password<input name="password" type="text" minlength="6" required autocomplete="off"></label>
+        <label>Base price (RM) <span class="muted small">(their Roundneck Short Sleeve price)</span>
+          <input name="base_price" type="number" step="0.01" min="0" placeholder="e.g. 15"></label>
       </div>
       <button class="btn btn-primary" type="submit">Create Customer Login</button>
     </form>
   </div>
   <div class="table-wrap"><table class="table">
-    <thead><tr><th>Customer</th><th>Username</th><th>Phone</th><th class="num">Store Credit</th><th>Status</th><th>Actions</th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="6" class="muted">No customers yet.</td></tr>'}</tbody>
+    <thead><tr><th>Customer</th><th>Username</th><th>Phone</th><th class="num">Base Price (RM)</th><th class="num">Store Credit</th><th>Status</th><th>Actions</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="7" class="muted">No customers yet.</td></tr>'}</tbody>
   </table></div>
   <div class="card">
     <h2>Portal Settings</h2>
@@ -2353,7 +2480,7 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
         <label>Rush order surcharge % <span class="muted small">(0 = rush orders off)</span>
           <input name="express_percent" type="number" step="1" min="0" max="100" value="${V.esc(setting('express_percent', '20'))}"></label>
         <label>Rush order lead time (days) <span class="muted small">(must be shorter than normal lead time)</span>
-          <input name="express_lead_days" type="number" step="1" min="0" max="30" value="${V.esc(setting('express_lead_days', '1'))}"></label>
+          <input name="express_lead_days" type="number" step="1" min="0" max="30" value="${V.esc(setting('express_lead_days', '2'))}"></label>
       </div>
       <button class="btn btn-primary" type="submit">Save Settings</button>
     </form>
@@ -2364,21 +2491,35 @@ app.get('/admin/customers', requireAdmin, (req, res) => {
     <form method="post" action="/admin/banners" enctype="multipart/form-data" class="stack">
       <div class="grid-fields">
         <label>Title <span class="req-chip">Required</span><input name="title" required maxlength="100" placeholder="e.g. New Retro Series now available!"></label>
-        <label>Link URL (optional — defaults to New Order)<input name="link_url" type="url" placeholder="https://..."></label>
+        <label>Text (optional)<input name="body" maxlength="200" placeholder="e.g. Fresh colours, same great prices. Order yours today."></label>
+        <label>Button text <span class="muted small">(default: Order Now)</span><input name="button_label" maxlength="30" placeholder="Order Now"></label>
+        <label>Button link (optional — defaults to New Order)<input name="link_url" type="url" placeholder="https://..."></label>
       </div>
-      <label>Text (optional)<input name="body" maxlength="200" placeholder="e.g. Fresh colours, same great prices. Order yours today."></label>
-      <label>Banner image (optional — jpg/png/webp, max 8MB)<input type="file" name="image" accept=".jpg,.jpeg,.png,.webp,.gif"></label>
+      <p class="muted small" style="margin:0.8rem 0 0.2rem"><strong>Banner photos</strong> (optional, jpg/png/webp, max 8MB each).
+      Upload one per screen size so each device gets a sharp, well-cropped photo; any size you skip falls back to the desktop photo.</p>
+      <div class="grid-fields">
+        <label>Desktop photo <span class="muted small">(recommended 840 &times; 380 px)</span>
+          <input type="file" name="image_desktop" accept=".jpg,.jpeg,.png,.webp,.gif"></label>
+        <label>Tablet photo <span class="muted small">(recommended 640 &times; 360 px)</span>
+          <input type="file" name="image_tablet" accept=".jpg,.jpeg,.png,.webp,.gif"></label>
+        <label>Mobile photo <span class="muted small">(recommended 780 &times; 290 px)</span>
+          <input type="file" name="image_mobile" accept=".jpg,.jpeg,.png,.webp,.gif"></label>
+      </div>
       <button class="btn btn-primary" type="submit">Add Banner</button>
     </form>
     ${(() => {
       const banners = db.prepare('SELECT * FROM banners ORDER BY active DESC, id DESC').all();
       if (!banners.length) return '';
       return `<div class="table-wrap" style="margin-top:1rem"><table class="table">
-        <thead><tr><th>Title</th><th>Text</th><th>Image</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Title</th><th>Text</th><th>Photos</th><th>Status</th><th></th></tr></thead>
         <tbody>${banners.map((b) => `<tr class="${b.active ? '' : 'inactive'}">
           <td data-label="Title"><strong>${V.esc(b.title)}</strong></td>
           <td data-label="Text">${V.esc(b.body || '-')}</td>
-          <td data-label="Image">${b.image_stored ? `<a href="/banners/${b.id}/image" target="_blank">${V.esc(b.image_name)}</a>` : '-'}</td>
+          <td data-label="Photos">${[
+            b.image_stored ? `<a href="/banners/${b.id}/image?size=desktop" target="_blank">Desktop</a>` : '',
+            b.image_stored_tablet ? `<a href="/banners/${b.id}/image?size=tablet" target="_blank">Tablet</a>` : '',
+            b.image_stored_mobile ? `<a href="/banners/${b.id}/image?size=mobile" target="_blank">Mobile</a>` : '',
+          ].filter(Boolean).join(' &middot; ') || '-'}</td>
           <td data-label="Status">${b.active ? '<span class="badge badge-confirmed">Live</span>' : '<span class="badge">Hidden</span>'}</td>
           <td data-label="" class="row-actions">
             <form method="post" action="/admin/banners/${b.id}/toggle" class="inline-form">
@@ -2437,25 +2578,34 @@ app.post('/admin/settings', requireAdmin, (req, res) => {
   setSetting('lead_days', isNaN(lead) || lead < 0 ? '3' : String(Math.min(lead, 60)));
   setSetting('quote_valid_days', isNaN(qvd) || qvd < 1 ? '14' : String(Math.min(qvd, 90)));
   setSetting('express_percent', isNaN(expPct) || expPct < 0 ? '0' : String(Math.min(expPct, 100)));
-  setSetting('express_lead_days', isNaN(expDays) || expDays < 0 ? '1' : String(Math.min(expDays, 30)));
+  setSetting('express_lead_days', isNaN(expDays) || expDays < 0 ? '2' : String(Math.min(expDays, 30)));
   flash(req, 'success', 'Settings saved. They apply to new orders and new quotations only.');
   res.redirect('/admin/customers');
 });
 
 app.post('/admin/banners', requireAdmin, runUpload(uploadBanner), (req, res) => {
+  const files = req.files || {};
+  const pick = (field) => (files[field] && files[field][0] ? files[field][0] : null);
+  const fd = pick('image_desktop');
+  const ft = pick('image_tablet');
+  const fm = pick('image_mobile');
   const title = String(req.body.title || '').trim().slice(0, 100);
   if (!title) {
-    if (req.file) fs.unlink(req.file.path, () => {});
+    for (const f of [fd, ft, fm]) if (f) fs.unlink(f.path, () => {});
     flash(req, 'error', 'Banner title is required.');
     return res.redirect('/admin/customers');
   }
   const link = String(req.body.link_url || '').trim().slice(0, 500);
-  db.prepare('INSERT INTO banners (title, body, link_url, image_stored, image_name) VALUES (?,?,?,?,?)').run(
+  db.prepare(`INSERT INTO banners
+    (title, body, link_url, button_label, image_stored, image_name, image_stored_tablet, image_name_tablet, image_stored_mobile, image_name_mobile)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`).run(
     title,
     String(req.body.body || '').trim().slice(0, 200),
     /^https?:\/\//i.test(link) ? link : '',
-    req.file ? req.file.filename : '',
-    req.file ? req.file.originalname : ''
+    String(req.body.button_label || '').trim().slice(0, 30),
+    fd ? fd.filename : '', fd ? fd.originalname : '',
+    ft ? ft.filename : '', ft ? ft.originalname : '',
+    fm ? fm.filename : '', fm ? fm.originalname : ''
   );
   flash(req, 'success', 'Banner added — it is live on the customer homepage.');
   res.redirect('/admin/customers');
@@ -2473,7 +2623,9 @@ app.post('/admin/banners/:id/delete', requireAdmin, (req, res) => {
   const b = db.prepare('SELECT * FROM banners WHERE id = ?').get(req.params.id);
   if (!b) return res.status(404).send('Not found');
   db.prepare('DELETE FROM banners WHERE id = ?').run(b.id);
-  if (b.image_stored) fs.unlink(path.join(UPLOAD_DIR, b.image_stored), () => {});
+  for (const stored of [b.image_stored, b.image_stored_tablet, b.image_stored_mobile]) {
+    if (stored) fs.unlink(path.join(UPLOAD_DIR, stored), () => {});
+  }
   flash(req, 'success', 'Banner deleted.');
   res.redirect('/admin/customers');
 });
@@ -2514,17 +2666,33 @@ app.post('/admin/customers', requireAdmin, (req, res) => {
     return res.redirect('/admin/customers');
   }
   try {
-    db.prepare('INSERT INTO users (username, password_hash, role, name, company, phone) VALUES (?,?,?,?,?,?)').run(
+    const basePrice = parseFloat(req.body.base_price);
+    db.prepare('INSERT INTO users (username, password_hash, role, name, company, phone, base_price) VALUES (?,?,?,?,?,?,?)').run(
       username,
       bcrypt.hashSync(password, 10),
       'customer',
       String(req.body.name).trim().slice(0, 100),
       String(req.body.company || '').trim().slice(0, 150),
-      String(req.body.phone || '').trim().slice(0, 50)
+      String(req.body.phone || '').trim().slice(0, 50),
+      !isNaN(basePrice) && basePrice > 0 ? basePrice : null
     );
     flash(req, 'success', `Customer created. Give them these credentials - username: ${username}`);
   } catch (e) {
     flash(req, 'error', 'That username is already taken.');
+  }
+  res.redirect('/admin/customers');
+});
+
+app.post('/admin/customers/:id/baseprice', requireAdmin, (req, res) => {
+  const c = db.prepare("SELECT * FROM users WHERE id = ? AND role = 'customer'").get(req.params.id);
+  if (!c) return res.status(404).send('Customer not found');
+  const raw = String(req.body.base_price ?? '').trim();
+  const price = raw === '' ? null : parseFloat(raw);
+  if (price !== null && (isNaN(price) || price < 0)) {
+    flash(req, 'error', 'Base price must be a number (or blank to unset).');
+  } else {
+    db.prepare('UPDATE users SET base_price = ? WHERE id = ?').run(price !== null && price > 0 ? price : null, c.id);
+    flash(req, 'success', `Base price ${price && price > 0 ? 'set to ' + V.rm(price) : 'cleared'} for ${c.name}. All products reprice automatically.`);
   }
   res.redirect('/admin/customers');
 });
@@ -2560,27 +2728,45 @@ app.get('/admin/customers/:id/pricing', requireAdmin, (req, res) => {
   }
   const rows = products
     .map(
-      (p) => `<tr>
-      <td data-label="Product"><strong>${V.esc(p.name)}</strong><div class="muted small">per ${V.esc(p.unit)}${tiersText(p.id) ? ' &middot; tiers: ' + V.esc(tiersText(p.id)) : ''}</div></td>
-      <td data-label="Base Price" class="num">${V.rm(p.base_price)}</td>
-      <td data-label="Customer Price" class="num">
+      (p) => {
+        const rule = p.fixed_price != null
+          ? `Fixed ${V.rm(p.fixed_price)}`
+          : `Base ${p.price_offset > 0 ? '+ ' + V.rm(p.price_offset) : p.price_offset < 0 ? '- ' + V.rm(Math.abs(p.price_offset)) : ''}`.trim();
+        const standard = p.fixed_price != null
+          ? p.fixed_price
+          : c.base_price != null && c.base_price > 0 ? Math.max(0, round2(c.base_price + (p.price_offset || 0))) : null;
+        return `<tr>
+      <td data-label="Product"><strong>${V.esc(p.name)}</strong><div class="muted small">${rule}${tiersText(p.id) ? ' &middot; tiers: ' + V.esc(tiersText(p.id)) : ''}</div></td>
+      <td data-label="Standard" class="num">${standard != null ? V.rm(standard) : '<span class="muted">set base price</span>'}</td>
+      <td data-label="Override" class="num">
         <input name="price_${p.id}" type="number" step="0.01" min="0"
-          value="${overrides[p.id] != null ? overrides[p.id] : ''}" placeholder="use base/tiers">
+          value="${overrides[p.id] != null ? overrides[p.id] : ''}" placeholder="standard">
       </td>
-      <td data-label="Effective" class="num"><strong>${V.rm(overrides[p.id] != null ? overrides[p.id] : p.base_price)}</strong></td>
-    </tr>`
+      <td data-label="Effective" class="num"><strong>${V.rm(priceFor(c.id, p.id, 1))}</strong></td>
+    </tr>`;
+      }
     )
     .join('');
   const body = `
   <div class="page-head"><div><h1>Pricing: ${V.esc(c.name)}</h1>
-  <p class="muted">${V.esc(c.company)} &middot; A customer price here overrides base price AND bulk tiers. Leave blank to use base price with bulk tiers.</p></div>
+  <p class="muted">${V.esc(c.company)} &middot; Standard = this customer's base price +/- the product offset (or the product's fixed price).
+  Type an override only where this customer should pay something different; blank = standard.</p></div>
   <a class="btn btn-ghost" href="/admin/customers">&larr; Back</a></div>
+  <div class="card">
+    <h2>Base Price</h2>
+    <form method="post" action="/admin/customers/${c.id}/baseprice" class="inline-form baseprice-form">
+      <label style="margin:0">Roundneck Short Sleeve price for ${V.esc(c.name)} (RM)
+        <input name="base_price" type="number" step="0.01" min="0" value="${c.base_price != null ? c.base_price : ''}" placeholder="e.g. 15"></label>
+      <button class="btn btn-primary" type="submit">Save Base Price</button>
+    </form>
+    <p class="muted small" style="margin-top:0.5rem">Changing it instantly reprices every product below (except fixed-price products and overrides).</p>
+  </div>
   <form method="post" action="/admin/customers/${c.id}/pricing">
     <div class="table-wrap"><table class="table">
-      <thead><tr><th>Product</th><th class="num">Base Price</th><th class="num">Customer Price (RM)</th><th class="num">Effective Price</th></tr></thead>
+      <thead><tr><th>Product</th><th class="num">Standard Price</th><th class="num">Override (RM)</th><th class="num">Effective Price</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
-    <button class="btn btn-primary btn-lg" type="submit">Save Pricing</button>
+    <button class="btn btn-primary btn-lg" type="submit">Save Overrides</button>
   </form>`;
   render(req, res, { title: `Pricing - ${c.name}`, user: req.user, body, active: 'customers' });
 });

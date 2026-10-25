@@ -76,6 +76,7 @@ function layout({ title, user, body, flash, active = '', whatsapp = '' }) {
         <a href="/orders" class="${active === 'orders' ? 'active' : ''}">My Orders</a>
         <a href="/orders/new" class="${active === 'new' ? 'active' : ''}">New Order</a>
         <a href="/quotes" class="${active === 'quotes' ? 'active' : ''}">Quotes</a>
+        <a href="/invoices" class="${active === 'invoices' ? 'active' : ''}">My Invoices</a>
         <a href="/account" class="${active === 'account' ? 'active' : ''}">My Account</a>`
     : '';
   return `<!doctype html>
@@ -160,17 +161,17 @@ function ordersTable(orders, { adminView = false } = {}) {
   return `<div class="table-wrap"><table class="table">
 <thead><tr>
   <th>Order #</th><th>Job Name</th>${adminView ? '<th>Customer</th>' : ''}
-  <th>Status</th><th class="num">Total</th><th>Date Submitted</th><th>Last Update</th><th></th>
+  <th>Last Update</th><th>Status</th><th>Date Submitted</th><th class="num">Total</th><th></th>
 </tr></thead>
 <tbody>
 ${orders.map((o) => `<tr>
   <td data-label="Order #"><a href="${base}${o.id}"><strong>${esc(o.order_no)}</strong></a><div class="muted small">${esc(o.invoice_no)}</div></td>
   <td data-label="Job Name">${esc(o.job_name || '-')}</td>
   ${adminView ? `<td data-label="Customer">${esc(o.customer_name)}</td>` : ''}
-  <td data-label="Status">${statusBadge(o.status)}${o.action_note ? `<div class="action-note">&#9888; ${esc(o.action_note)}</div>` : ''}</td>
-  <td data-label="Total" class="num">${rm(o.total)}</td>
-  <td data-label="Date Submitted">${esc(fmtDate(o.created_at))}</td>
   <td data-label="Last Update">${esc(fmtDate(o.updated_at || o.created_at))}</td>
+  <td data-label="Status">${statusBadge(o.status)}${o.action_note ? `<div class="action-note">&#9888; ${esc(o.action_note)}</div>` : ''}</td>
+  <td data-label="Date Submitted">${esc(fmtDate(o.created_at))}</td>
+  <td data-label="Total" class="num">${rm(o.total)}</td>
   <td data-label=""><a class="btn btn-sm btn-outline" href="${base}${o.id}">View</a></td>
 </tr>`).join('')}
 </tbody></table></div>`;

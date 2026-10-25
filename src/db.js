@@ -254,6 +254,15 @@ ensureColumn('orders', 'refund_ref', "refund_ref TEXT DEFAULT ''");
 ensureColumn('orders', 'refund_note', "refund_note TEXT DEFAULT ''");
 ensureColumn('orders', 'refund_resolved_at', 'refund_resolved_at TEXT');
 ensureColumn('files', 'quote_id', 'quote_id INTEGER REFERENCES quotes(id)');
+ensureColumn('users', 'base_price', 'base_price REAL');
+ensureColumn('products', 'price_offset', 'price_offset REAL');
+ensureColumn('products', 'fixed_price', 'fixed_price REAL');
+ensureColumn('banners', 'button_label', "button_label TEXT DEFAULT ''");
+ensureColumn('banners', 'image_stored_tablet', "image_stored_tablet TEXT DEFAULT ''");
+ensureColumn('banners', 'image_name_tablet', "image_name_tablet TEXT DEFAULT ''");
+ensureColumn('banners', 'image_stored_mobile', "image_stored_mobile TEXT DEFAULT ''");
+ensureColumn('banners', 'image_name_mobile', "image_name_mobile TEXT DEFAULT ''");
+ensureColumn('quotes', 'job_name', "job_name TEXT NOT NULL DEFAULT ''");
 
 // ---- seed ----
 const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
@@ -263,6 +272,7 @@ if (userCount === 0) {
   );
   ins.run('admin', bcrypt.hashSync('admin123', 10), 'admin', 'Administrator', 'Aramega Textile Sdn Bhd', '');
   ins.run('demo', bcrypt.hashSync('demo123', 10), 'customer', 'Demo Customer', 'Demo Trading Sdn Bhd', '012-3456789');
+  db.prepare("UPDATE users SET base_price = 15 WHERE username = 'demo'").run();
 }
 
 const productCount = db.prepare('SELECT COUNT(*) AS n FROM products').get().n;
@@ -286,6 +296,54 @@ if (productCount === 0) {
   for (const n of NAMES) ins.run(n);
 }
 
+// Price ladder relative to the customer's base price (base = Roundneck Short Sleeve).
+// null offset with a fixed price means the product costs the same for every customer.
+const PRICE_LADDER = {
+  'Roundneck Short Sleeve': { offset: 0 },
+  'Roundneck Long Sleeve': { offset: 3 },
+  'Roundneck Long Sleeve (Kids)': { offset: 1 },
+  'Roundneck Short Sleeve (Kids)': { offset: -2 },
+  'Roundneck Sleeveless': { offset: -2 },
+  'Vneck Short Sleeve': { offset: 3 },
+  'Vneck Long Sleeve': { offset: 5 },
+  'Vneck Short Sleeve (Kids)': { offset: 1 },
+  'Vneck Long Sleeve (Kids)': { offset: 3 },
+  'Vneck Sleeveless': { offset: 1 },
+  'Polo Short Sleeve': { offset: 3 },
+  'Polo Long Sleeve': { offset: 5 },
+  'Polo Short Sleeve (Kids)': { offset: 1 },
+  'Mandarin Short Sleeve': { offset: 3 },
+  'Mandarin Long Sleeve': { offset: 5 },
+  'Retro Short Sleeve': { offset: 5 },
+  'Retro Short Sleeve (Kids)': { offset: 2 },
+  'Retro Long Sleeve': { offset: 7 },
+  'NFL Short Sleeve': { offset: 5 },
+  'NFL Long Sleeve': { offset: 7 },
+  'NFL Short Sleeve (Kids)': { offset: 2 },
+  'Muslimah': { offset: 8 },
+  'Muslimah (Kids)': { offset: 6 },
+  'Raglan Short Sleeve': { offset: 3 },
+  'Raglan Long Sleeve': { offset: 5 },
+  'Raglan Short Sleeve (Kids)': { offset: 1 },
+  'Uniform Short Sleeve': { fixed: 45 },
+  'Uniform Long Sleeve': { fixed: 55 },
+  'Short Pants': { offset: 0 },
+  'Long Pants': { offset: 3 },
+  'Pants (Kids)': { offset: -2 },
+  'Add On Pocket': { offset: 2 },
+  'Add On Zip': { offset: 2 },
+  'Flag': { fixed: 15 },
+};
+// One-time fill: apply the ladder to products that have no offset/fixed price yet.
+{
+  const unset = db.prepare('SELECT id, name FROM products WHERE price_offset IS NULL AND fixed_price IS NULL').all();
+  const upd = db.prepare('UPDATE products SET price_offset = ?, fixed_price = ? WHERE id = ?');
+  for (const p of unset) {
+    const rule = PRICE_LADDER[p.name];
+    if (rule) upd.run(rule.offset != null ? rule.offset : null, rule.fixed != null ? rule.fixed : null, p.id);
+  }
+}
+
 function setting(key, fallback) {
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
   return row ? row.value : fallback;
@@ -303,7 +361,8 @@ if (setting('lead_days', null) === null) setSetting('lead_days', '3');
 if (setting('whatsapp', null) === null) setSetting('whatsapp', '');
 if (setting('quote_valid_days', null) === null) setSetting('quote_valid_days', '14');
 if (setting('express_percent', null) === null) setSetting('express_percent', '20');
-if (setting('express_lead_days', null) === null) setSetting('express_lead_days', '1');
+if (setting('express_lead_days', null) === null) setSetting('express_lead_days', '2');
+if (setting('express_lead_days', null) === '1') setSetting('express_lead_days', '2'); // rush orders are ready 2 days after submission
 
 function nextInvoiceNo() {
   const next = parseInt(setting('invoice_seq', '10000'), 10) + 1;
@@ -335,19 +394,29 @@ function tiersFor(productId) {
 
 // Unit price for a customer at a given quantity:
 // 1. a customer-specific price set by admin always wins (flat, any qty);
-// 2. otherwise the best quantity tier the qty reaches;
-// 3. otherwise the product base price.
+// 2. otherwise a product's fixed price (same for every customer);
+// 3. otherwise the best quantity tier the qty reaches;
+// 4. otherwise the customer's base price plus the product's offset
+//    (base price = the customer's Roundneck Short Sleeve price);
+// 5. otherwise the legacy product base price (0 = not priced yet, unorderable).
 function priceFor(customerId, productId, qty) {
   const override = db
     .prepare('SELECT price FROM customer_prices WHERE customer_id = ? AND product_id = ?')
     .get(customerId, productId);
   if (override) return override.price;
+  const p = db.prepare('SELECT base_price, price_offset, fixed_price FROM products WHERE id = ?').get(productId);
+  if (p.fixed_price != null) return p.fixed_price;
   const q = Math.max(1, qty || 1);
-  let price = db.prepare('SELECT base_price FROM products WHERE id = ?').get(productId).base_price;
+  let tierPrice = null;
   for (const t of tiersFor(productId)) {
-    if (q >= t.min_qty) price = t.price;
+    if (q >= t.min_qty) tierPrice = t.price;
   }
-  return price;
+  if (tierPrice != null) return tierPrice;
+  const u = db.prepare('SELECT base_price FROM users WHERE id = ?').get(customerId);
+  if (u && u.base_price != null && u.base_price > 0) {
+    return Math.max(0, Math.round((u.base_price + (p.price_offset || 0)) * 100) / 100);
+  }
+  return p.base_price;
 }
 
 // Verified money on an order: verified bank payments + store credit applied at submission.
@@ -375,5 +444,5 @@ function touchOrder(orderId) {
 
 module.exports = {
   db, nextInvoiceNo, nextQuoteNo, randomOrderNo, priceFor, tiersFor, setting, setSetting,
-  paidFor, creditBalance, logEvent, touchOrder,
+  paidFor, creditBalance, logEvent, touchOrder, PRICE_LADDER,
 };

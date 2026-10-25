@@ -566,14 +566,56 @@ tr.inactive, .product-row.inactive { opacity: 0.55; }
 .hero-body { margin: 0 0 1.1rem; color: #eefcce; font-size: 0.98rem; max-width: 46ch; }
 .hero-btn { background: #fff; color: var(--lime-800); font-weight: 700; box-shadow: 0 2px 8px rgba(26, 46, 5, 0.3); padding: 0.45rem 1.1rem; font-size: 0.9rem; }
 .hero-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(26, 46, 5, 0.35); color: var(--lime-900); }
-.hero-img { flex: 0 1 300px; align-self: stretch; display: flex; align-items: center; }
-.hero-img img { width: 100%; max-height: 190px; object-fit: cover; border-radius: 12px; box-shadow: 0 6px 20px rgba(26, 46, 5, 0.3); }
+.hero-img { flex: 0 1 460px; align-self: stretch; display: flex; align-items: center; }
+.hero-img img { width: 100%; max-height: 210px; object-fit: cover; border-radius: 12px; box-shadow: 0 6px 20px rgba(26, 46, 5, 0.3); }
 .hero-dots { position: absolute; bottom: 0.85rem; left: 2.4rem; display: flex; gap: 0.45rem; }
 .hero-dot {
   width: 9px; height: 9px; border-radius: 50%; border: none; cursor: pointer; padding: 0;
   background: rgba(255, 255, 255, 0.45); transition: background 0.15s var(--ease), transform 0.15s var(--ease);
 }
 .hero-dot.active { background: #fff; transform: scale(1.25); }
+.hero-arrow {
+  position: absolute; top: 50%; transform: translateY(-50%); z-index: 2;
+  width: 40px; height: 40px; border-radius: 50%; border: none; cursor: pointer;
+  background: rgba(255,255,255,0.88); color: var(--lime-800); font-size: 1.05rem;
+  box-shadow: 0 2px 10px rgba(26,46,5,0.35); display: none; align-items: center; justify-content: center;
+  transition: background 0.15s var(--ease), transform 0.15s var(--ease);
+}
+.hero-arrow:hover { background: #fff; transform: translateY(-50%) scale(1.08); }
+.hero-prev { left: 0.9rem; }
+.hero-next { right: 0.9rem; }
+@media (min-width: 1025px) {
+  .hero-arrow { display: flex; }
+  .hero-slide { padding-left: 3.8rem; padding-right: 3.8rem; }
+}
+/* status filter chips */
+.chip-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.05rem; }
+.chip {
+  text-decoration: none; border: 1px solid var(--border); background: var(--card); color: var(--ink);
+  border-radius: 999px; padding: 0.3rem 0.85rem; font-size: 0.86rem; font-weight: 600;
+  transition: border-color 0.15s var(--ease), background 0.15s var(--ease), color 0.15s var(--ease);
+}
+.chip:hover { border-color: var(--lime-400); }
+.chip.active { background: var(--lime-600); color: #fff; border-color: var(--lime-600); }
+.chip-n { opacity: 0.72; font-size: 0.8em; }
+/* paid chop + strip on the invoice */
+.invoice-sheet { position: relative; }
+.paid-strip {
+  background: #e9f9e4; color: #15803d; border: 1.5px solid #8fd99a; text-align: center;
+  font-weight: 800; letter-spacing: 0.22em; padding: 0.42rem; border-radius: 9px; margin-bottom: 1.1rem;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact;
+}
+.paid-stamp {
+  position: absolute; top: 170px; right: 44px; transform: rotate(-45deg); z-index: 5;
+  pointer-events: none; opacity: 0.88; -webkit-print-color-adjust: exact; print-color-adjust: exact;
+}
+.paid-stamp span {
+  display: block; border: 5px double #16a34a; color: #16a34a; font-weight: 900; font-size: 2.5rem;
+  letter-spacing: 0.3em; padding: 0.12em 0.35em 0.12em 0.62em; border-radius: 12px; text-transform: uppercase;
+}
+.inv-void td { opacity: 0.6; }
+.baseprice-form { display: flex; gap: 0.45rem; align-items: flex-end; flex-wrap: wrap; }
+.baseprice-form input { max-width: 130px; }
 
 .attn-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.7rem; }
 .attn-list li { background: var(--hover); border: 1px solid var(--border); border-radius: 10px; padding: 0.6rem 0.85rem; }
